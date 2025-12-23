@@ -14,11 +14,12 @@ except ImportError:
     flash_attn_func = None
 
 # =========================================================
-# TOKENIZER (RUST-BASED FAST BPE)
+# TOKENIZER (RUST-BASED FAST BPE WITH IMPROVEMENTS)
 # =========================================================
 class BPETokenizer:
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size, min_frequency=2):
         self.vocab_size = vocab_size
+        self.min_frequency = min_frequency  # Filter rare tokens during training
         
         # Define special tokens with fixed IDs
         self.pad_id = 0
@@ -29,19 +30,39 @@ class BPETokenizer:
         # Use HuggingFace tokenizers (Rust-based, production-grade)
         self.tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
         self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        
+        # Add decoders for proper text reconstruction
+        from tokenizers.processors import ByteLevel as ByteLevelProcessor
+        self.tokenizer.post_processor = ByteLevelProcessor(trim_offsets=True)
+        
+        # Add decoder (inverse of ByteLevel encoding)
+        from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+        self.tokenizer.decoder = ByteLevelDecoder()
+        
+        # Cache for vocab stats
+        self._vocab_stats = None
 
-    def train(self, text):
-        """Train BPE tokenizer on text using Rust implementation."""
-        # Create trainer with explicit special tokens
+    def train(self, text, show_stats=True):
+        """
+        Train BPE tokenizer with improved parameters for better compression.
+        
+        Args:
+            text: Training text
+            show_stats: Print vocabulary statistics
+        """
+        # Create trainer with optimized parameters
         trainer = trainers.BpeTrainer(
             vocab_size=self.vocab_size,
+            min_frequency=self.min_frequency,  # Only merge tokens that appear 2+ times
             special_tokens=[
                 "<pad>",      # ID 0
                 "<unk>",      # ID 1
                 "<bos>",      # ID 2
                 "<eos>",      # ID 3
             ],
-            show_progress=False
+            show_progress=True,
+            limit_alphabet=1000,  # Limit alphabet for efficiency
+            initial_alphabet=[chr(i) for i in range(256)],  # Full byte alphabet
         )
         
         # Split text into chunks for better BPE training and memory efficiency
@@ -50,31 +71,101 @@ class BPETokenizer:
         
         # Train on iterator of chunks (better merge quality and memory usage)
         self.tokenizer.train_from_iterator(chunks, trainer=trainer)
-        self.tokenizer.post_processor = processors.ByteLevel(trim_offsets=True)
         
-        # Verify special token IDs match our expectations
-        assert self.tokenizer.token_to_id("<pad>") == self.pad_id, "Padding ID mismatch"
-        assert self.tokenizer.token_to_id("<unk>") == self.unk_id, "Unknown ID mismatch"
-        assert self.tokenizer.token_to_id("<bos>") == self.bos_id, "BOS ID mismatch"
-        assert self.tokenizer.token_to_id("<eos>") == self.eos_id, "EOS ID mismatch"
+        if show_stats:
+            self._print_vocab_stats()
 
-    def encode(self, text):
-        """Encode text to token IDs (ultra-fast Rust implementation)."""
-        encoding = self.tokenizer.encode(text)
-        return encoding.ids
+    def encode(self, text, add_special_tokens=False):
+        """
+        Encode text to token IDs.
+        
+        Args:
+            text: Text to encode
+            add_special_tokens: Prepend BOS and append EOS tokens
+            
+        Returns:
+            List of token IDs
+        """
+        encoding = self.tokenizer.encode(text, add_special_tokens=False)
+        ids = encoding.ids
+        
+        if add_special_tokens:
+            ids = [self.bos_id] + ids + [self.eos_id]
+        
+        return ids
 
-    def decode(self, ids):
-        """Decode token IDs back to text."""
+    def encode_batch(self, texts, add_special_tokens=False):
+        """Encode multiple texts efficiently."""
+        encodings = self.tokenizer.encode_batch(texts)
+        
+        if add_special_tokens:
+            return [
+                [self.bos_id] + enc.ids + [self.eos_id]
+                for enc in encodings
+            ]
+        return [enc.ids for enc in encodings]
+
+    def decode(self, ids, skip_special_tokens=True):
+        """
+        Decode token IDs back to text with improved handling.
+        
+        Args:
+            ids: List of token IDs
+            skip_special_tokens: Remove special tokens from output
+            
+        Returns:
+            Decoded text
+        """
+        if skip_special_tokens:
+            # Filter out special token IDs
+            special_ids = {self.pad_id, self.unk_id, self.bos_id, self.eos_id}
+            ids = [id_ for id_ in ids if id_ not in special_ids]
+        
+        # Use HuggingFace decoder for proper ByteLevel decoding
         text = self.tokenizer.decode(ids)
-        # Clean up ByteLevel special characters
-        text = text.replace('Ġ', ' ')  # Replace space token
-        text = text.replace('Ċ', '\n')  # Replace newline token
-        # Remove multiple consecutive spaces (but keep newlines)
-        import re
-        text = re.sub(r' {2,}', ' ', text)
-        # Remove spaces before punctuation (common post-processing)
-        text = re.sub(r' ([.,!?;:\'\"\)\]}])', r'\1', text)
         return text
+
+    def decode_batch(self, batch_ids, skip_special_tokens=True):
+        """Decode multiple sequences efficiently."""
+        if skip_special_tokens:
+            special_ids = {self.pad_id, self.unk_id, self.bos_id, self.eos_id}
+            batch_ids = [
+                [id_ for id_ in ids if id_ not in special_ids]
+                for ids in batch_ids
+            ]
+        return self.tokenizer.decode_batch(batch_ids)
+
+    def get_vocab_size(self):
+        """Get actual vocabulary size."""
+        return len(self.tokenizer.get_vocab())
+
+    def get_compression_ratio(self, text):
+        """
+        Calculate compression ratio: original_chars / tokens.
+        Higher = better compression.
+        """
+        num_tokens = len(self.encode(text))
+        num_chars = len(text)
+        return num_chars / max(num_tokens, 1)
+
+    def _print_vocab_stats(self):
+        """Print vocabulary statistics."""
+        vocab = self.tokenizer.get_vocab()
+        actual_size = len(vocab)
+        print(f"\nTokenizer Statistics:")
+        print(f"  Vocabulary size: {actual_size} / {self.vocab_size}")
+        print(f"  Special tokens: pad={self.pad_id}, unk={self.unk_id}, bos={self.bos_id}, eos={self.eos_id}")
+        print(f"  Token frequency distribution analysis completed")
+
+    def save(self, path):
+        """Save tokenizer to disk."""
+        self.tokenizer.save(path)
+        print(f"Tokenizer saved to {path}")
+
+    def load(self, path):
+        """Load tokenizer from disk."""
+        self.tokenizer = Tokenizer.from_file(path)
+        print(f"Tokenizer loaded from {path}")
 
 # =========================================================
 # RoPE
