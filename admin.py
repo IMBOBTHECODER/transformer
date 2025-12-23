@@ -52,8 +52,8 @@ class GPTConfig:
     init_std: float = 0.02
     
     # training
-    total_steps: int = 10000  # Total optimizer steps
-    warmup_steps: int = 2000
+    total_steps: int = 2000  # Total optimizer steps
+    warmup_steps: int = 200
     val_interval: int = 100  # Validate every N steps
     use_ema: bool = True
     ema_decay: float = 0.99
