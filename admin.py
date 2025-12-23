@@ -21,7 +21,7 @@ class GPTConfig:
     mlp_ratio: int = 4
 
     # performance
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = torch.float32
     compile: bool = True
     use_rope: bool = True
     use_kv_cache: bool = True
@@ -37,7 +37,7 @@ class GPTConfig:
     lr: float = 3e-4
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
-    batch_size: int = 32
+    batch_size: int = 64
     sequence_length: int = 512
     
     # advanced optimizations
@@ -52,9 +52,9 @@ class GPTConfig:
     init_std: float = 0.02
     
     # training
-    total_steps: int = 100000  # Total optimizer steps
+    total_steps: int = 10000  # Total optimizer steps
     warmup_steps: int = 2000
-    val_interval: int = 1000  # Validate every N steps
+    val_interval: int = 100  # Validate every N steps
     use_ema: bool = True
     ema_decay: float = 0.99
     val_split: float = 0.05  # Hold 5% for validation
@@ -230,7 +230,7 @@ if __name__ == "__main__":
         text_tokens, 
         cfg, 
         val_split=cfg.val_split,
-        num_workers=0  # Set to 2-4 for multi-processing if needed (disable on Windows with multiprocessing issues)
+        num_workers=0  # Keep at 0 to avoid multiprocessing conflicts with tokenizers
     )
 
     # Initialize model
