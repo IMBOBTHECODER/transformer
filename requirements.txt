@@ -1,0 +1,4 @@
+# Python
+torch>=2.0.0
+datasets>=2.10.0
+tokenizers>=0.13.0
