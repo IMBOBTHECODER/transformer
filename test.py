@@ -8,7 +8,7 @@ import os
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
 
 # Load the EMA model weights
-ema_state_dict = torch.load(r"C:\Downloads\best_ema_model.pt", map_location=device)
+ema_state_dict = torch.load("best_ema_model.pt", map_location=device)
 model.load_state_dict(ema_state_dict)
 model.eval()
 
