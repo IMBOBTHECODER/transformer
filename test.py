@@ -1,6 +1,6 @@
 import torch
 from core import GPT, BPETokenizer
-from admin import cfg, device, generate
+from admin import cfg, device, generate, HAS_XLA
 from datasets import load_dataset
 import os
 import argparse
@@ -10,8 +10,14 @@ cfg.compile_mode = "max-autotune"
 # Initialize model with the same config
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
 
-# Load the EMA model weights - handle compiled model state dict
-ema_state_dict = torch.load("model/best_ema_model.pt", map_location=device)
+# Load the EMA model weights - handle XLA device tags and compiled model state dict
+# XLA-saved models need to be loaded to CPU first, then moved to target device
+if HAS_XLA:
+    # On TPU: load to CPU first to strip XLA storage tags
+    ema_state_dict = torch.load("model/best_ema_model.pt", map_location='cpu')
+else:
+    # On GPU/CPU: load directly to device
+    ema_state_dict = torch.load("model/best_ema_model.pt", map_location=device)
 
 # If state dict has "_orig_mod." prefix (from torch.compile), remove it
 if any(k.startswith("_orig_mod.") for k in ema_state_dict.keys()):
