@@ -10,15 +10,24 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 
+# Try to import XLA for TPU support
+try:
+    import torch_xla.core.xla_model as xm
+    from torch_xla.distributed.parallel_loader import MpDeviceLoader
+    HAS_XLA = True
+except ImportError:
+    HAS_XLA = False
+    MpDeviceLoader = None
+
 # =========================================================
 # CONFIG
 # =========================================================
 @dataclass
 class GPTConfig:
     # main
-    vocab_size: int = 20000
+    vocab_size: int = 16000
     d_model: int = 384
-    n_heads: int = 8
+    n_heads: int = 6
     n_layers: int = 8
     mlp_ratio: int = 4
     yarn_scale: float = 1.0  # YaRN: scale for RoPE max_seq_len during generation
@@ -41,13 +50,13 @@ class GPTConfig:
     lr: float = 3e-4
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
-    batch_size: int = 64
+    batch_size: int = 128
     sequence_length: int = 512
     
     # advanced optimizations
     dropout: float = 0.1
     label_smoothing: float = 0.1
-    gradient_accumulation_steps: int = 4  # Effective batch size = batch_size * accumulation_steps
+    gradient_accumulation_steps: int = 1  # TPU: disable accumulation (use batch_size instead for XLA fusion)
 
     # SAM (Sharpness-Aware Minimization)
     sam: bool = False
@@ -57,23 +66,38 @@ class GPTConfig:
     init_std: float = 0.02
     
     # training
-    total_steps: int = 1500
-    val_interval: int = 20
-    use_ema: bool = True
+    total_steps: int = 2000
+    val_interval: int = 200
+    use_ema: bool = False # Currently disabled for TPU training
     ema_decay: float = 0.99
-    ema_update_interval: float = 0.02  # Update EMA every 2% of total_steps (not every step)
+    ema_update_interval: float = 0.02
     val_split: float = 0.05
     # warmup_steps: 15% or 50 steps
 
 cfg = GPTConfig()
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# Use BF16 on GPU (Ampere+), fall back to float32 on CPU for stability
-if device == "cpu": cfg.dtype = torch.float32
-else: cfg.dtype = torch.bfloat16
+
+# Device selection: TPU > GPU > CPU
+if HAS_XLA:
+    device = xm.xla_device()  # Use TPU via XLA
+    cfg.dtype = torch.bfloat16  # BF16 optimal for TPU
+    cfg.compile = False  # TPU: disable torch.compile (XLA is implicit, torch.compile adds overhead)
+    cfg.dropout = 0.0  # TPU: disable dropout (interferes with XLA fusion, not needed for training stability)
+    cfg.gradient_checkpointing = False  # XLA handles memory; checkpointing adds useless recomputation
+    cfg.use_flash_attention = False  # TPU: SDPA is unfused, no FlashAttention support (~3-6x slower than GPU FA)
+    cfg.sam = False  # SAM overhead not worth it on TPU
+    print("Using TPU (XLA backend)")
+elif torch.cuda.is_available():
+    device = "cuda"
+    cfg.dtype = torch.bfloat16  # BF16 for Ampere+
+    print("Using CUDA GPU")
+else:
+    device = "cpu"
+    cfg.dtype = torch.float32  # FP32 for CPU stability
+    print("Using CPU")
     
-# CUDA optimizations
-torch.set_float32_matmul_precision("high")
-if device == "cuda":
+# Backend optimizations (GPU only)
+if torch.cuda.is_available() and not HAS_XLA:
+    torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True  # Auto-tune for faster convolutions
     torch.backends.cuda.matmul.allow_tf32 = True  # TF32 for matrix multiplications
     torch.backends.cudnn.allow_tf32 = True
@@ -117,8 +141,9 @@ class TokenSequenceDataset(Dataset):
             token_start = max(0, token_end - self.seq_len)
         
         # Use torch.from_numpy (zero-copy) instead of torch.tensor (copies data)
-        seq = torch.from_numpy(self.token_stream[token_start:token_end].copy())
-        tgt = torch.from_numpy(self.token_stream[token_start + 1:token_end + 1].copy())
+        # Remove .copy() to enable true zero-copy operation
+        seq = torch.from_numpy(self.token_stream[token_start:token_end])
+        tgt = torch.from_numpy(self.token_stream[token_start + 1:token_end + 1])
         
         return seq, tgt
 
@@ -152,24 +177,28 @@ def create_data_loaders(token_stream, cfg, val_split=0.05, num_workers=None):
     val_dataset = TokenSequenceDataset(val_tokens, cfg.sequence_length)
     
     # Create dataloaders with optimizations
+    # TPU prefers static shapes; use 0 workers if on TPU, else auto-detect
+    num_workers_default = 0 if HAS_XLA else (4 if device == 'cuda' else 2)
+    is_cuda = (device == 'cuda')
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
-        shuffle=False,  # NO shuffle: preserve sequential continuity for LM (shuffling harms perplexity)
-        num_workers=num_workers,
-        persistent_workers=(num_workers > 0),  # Avoid worker startup overhead
-        pin_memory=(device == 'cuda'),  # Speed up GPU transfer
+        shuffle=False,
+        num_workers=num_workers_default,
+        persistent_workers=(num_workers_default > 0),  # Avoid worker startup overhead
+        pin_memory=is_cuda,  # Speed up GPU transfer (only for CUDA)
         drop_last=True,  # Drop incomplete last batch
-        prefetch_factor=3 if num_workers > 0 else None,  # Increased prefetch
+        prefetch_factor=3 if num_workers_default > 0 else None,  # Increased prefetch
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.batch_size,
         shuffle=False,  # No shuffle for validation
-        num_workers=num_workers,
-        persistent_workers=(num_workers > 0),
-        pin_memory=(device == 'cuda'),
+        num_workers=num_workers_default,
+        persistent_workers=(num_workers_default > 0),
+        pin_memory=is_cuda,  # Speed up GPU transfer (only for CUDA)
         drop_last=False,
     )
     
@@ -215,8 +244,8 @@ if __name__ == "__main__":
     # Load dataset
     print("Loading dataset...")
 
-    # Load exactly 100,000 examples from the train split
-    ds = load_dataset("roneneldan/TinyStories", split="train[:100000]")
+    # Load exactly 150,000 examples from the train split
+    ds = load_dataset("roneneldan/TinyStories", split="train[:150000]")
 
     # Extract the text field
     texts = [sample["text"] for sample in ds]
@@ -265,12 +294,21 @@ if __name__ == "__main__":
         # num_workers auto-detected for GPU/CPU optimization
     )
 
+    # Wrap dataloaders with MpDeviceLoader on TPU (eliminates Python iteration overhead)
+    if HAS_XLA and MpDeviceLoader is not None:
+        print("Wrapping dataloaders with MpDeviceLoader for XLA input pipeline fusion...")
+        train_loader = MpDeviceLoader(train_loader, device)
+        val_loader = MpDeviceLoader(val_loader, device)
+
     # Initialize model
     print("\nInitializing GPT model...")
     model = GPT(cfg).to(device=device, dtype=cfg.dtype)
     if cfg.compile:
-        print(f"Compiling model with mode='{cfg.compile_mode}' for maximum speed...")
-        model = torch.compile(model, mode=cfg.compile_mode)
+        if HAS_XLA:
+            print("TPU detected: Skipping torch.compile (XLA handles compilation)")
+        else:
+            print(f"Compiling model with mode='{cfg.compile_mode}' for maximum speed...")
+            model = compile_model(model, mode=cfg.compile_mode)
     optimizer = build_optimizer(model, cfg)
 
     # EMA (Exponential Moving Average) for smooth weights
@@ -283,16 +321,27 @@ if __name__ == "__main__":
 
     warmp_steps = max(50, int(cfg.total_steps * 0.15))
 
+    # Precompute full LR schedule as Python list (avoids device syncs on TPU)
+    def get_lr_scale(step):
+        if step < warmp_steps:
+            return step / warmp_steps
+        else:
+            progress = (step - warmp_steps) / (cfg.total_steps - warmp_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+    
+    lr_schedule = [cfg.lr * get_lr_scale(i) for i in range(cfg.total_steps)]
+
     # BF16 training (no scaler needed)
     best_val_loss = float('inf')
     ema_state_dict = None
     ema_update_steps = max(1, int(cfg.total_steps * cfg.ema_update_interval))
 
-    # Training loop: fixed number of steps with gradient accumulation
+    # Training loop: fixed number of steps (NO gradient accumulation on TPU)
     step = 0
     start_time = time.perf_counter()
     tokens_processed = 0
-    train_iter = iter(train_loader)  # Persistent iterator for sequential accumulation
+    loss_buffer = []  # Buffer losses to avoid device sync on TPU
+    train_iter = iter(train_loader)  # Persistent iterator for sequential batches
     while step < cfg.total_steps:
         # Get batch from persistent iterator (NOT from for loop)
         try:
@@ -302,29 +351,38 @@ if __name__ == "__main__":
             train_iter = iter(train_loader)
             x_batch, y_batch = next(train_iter)
         
-        # Move to device if not already there
-        x_batch = x_batch.to(device, dtype=torch.long)
-        y_batch = y_batch.to(device, dtype=torch.long)
+        # Move to device (MpDeviceLoader already places on device, but .to() is no-op then)
+        # For non-TPU: this transfers GPU memory
+        # For TPU+MpDeviceLoader: this is a no-op (already on device)
+        if not HAS_XLA:
+            x_batch = x_batch.to(device, dtype=torch.long)
+            y_batch = y_batch.to(device, dtype=torch.long)
+        else:
+            # On TPU with MpDeviceLoader, tensors already on device
+            # Just ensure correct dtype
+            x_batch = x_batch.to(dtype=torch.long)
+            y_batch = y_batch.to(dtype=torch.long)
         
         # Track tokens for throughput
         batch_tokens = x_batch.numel()
         
-        # Warmup learning rate
-        if step < warmp_steps:
-            lr_scale = step / warmp_steps
+        # Set learning rate from precomputed schedule (Python list, no device sync)
+        # TPU: update every 4 steps to reduce recompilation overhead (minimal accuracy loss)
+        if step % 4 == 0:
+            base_opt = optimizer.base if cfg.sam else optimizer
+            base_opt.param_groups[0]['lr'] = lr_schedule[step]
+        
+        # Forward pass (NO autocast on TPU - XLA handles dtype natively)
+        if HAS_XLA:
+            # TPU: XLA handles mixed precision, no torch.autocast
+            logits, _ = model(x_batch)
+            loss = F.cross_entropy(
+                logits.flatten(0, 1),
+                y_batch.flatten(),
+                label_smoothing=cfg.label_smoothing
+            )
         else:
-            # Cosine annealing from warmup to 0
-            progress = (step - warmp_steps) / (cfg.total_steps - warmp_steps)
-            lr_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-        
-        base_opt = optimizer.base if cfg.sam else optimizer
-        for param_group in base_opt.param_groups:
-            param_group['lr'] = cfg.lr * lr_scale
-        
-        # Gradient accumulation loop
-        accumulated_loss = 0.0
-        for acc_step in range(cfg.gradient_accumulation_steps):
-            # Mixed precision with torch.autocast (BF16 on GPU, FP32 on CPU)
+            # GPU: Use autocast for BF16
             with torch.autocast(device_type=device, dtype=cfg.dtype if device == 'cuda' else torch.float32):
                 logits, _ = model(x_batch)
                 loss = F.cross_entropy(
@@ -332,26 +390,14 @@ if __name__ == "__main__":
                     y_batch.flatten(),
                     label_smoothing=cfg.label_smoothing
                 )
-            
-            # Scale loss by accumulation steps
-            scaled_loss = loss / cfg.gradient_accumulation_steps
-            scaled_loss.backward()
-            accumulated_loss += loss.item()
-            
-            # Get next batch for subsequent accumulation steps if needed
-            if acc_step < cfg.gradient_accumulation_steps - 1:
-                try:
-                    x_batch, y_batch = next(train_iter)
-                except StopIteration:
-                    # Reset iterator when dataset exhausted
-                    train_iter = iter(train_loader)
-                    x_batch, y_batch = next(train_iter)
-                
-                # Move to device
-                x_batch = x_batch.to(device, dtype=torch.long)
-                y_batch = y_batch.to(device, dtype=torch.long)
         
-        # Gradient clipping after accumulation
+        # Backward pass
+        loss.backward()
+        # Store loss WITHOUT calling .item() (avoids XLA device sync)
+        # Detach to prevent XLA graph retention (loss is only for logging, not gradients)
+        loss_buffer.append(loss.detach())
+        
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
         # SAM: first step to perturb weights
@@ -365,23 +411,39 @@ if __name__ == "__main__":
                 train_iter = iter(train_loader)
                 x_batch_sam, y_batch_sam = next(train_iter)
             
-            x_batch_sam = x_batch_sam.to(device, dtype=torch.long)
-            y_batch_sam = y_batch_sam.to(device, dtype=torch.long)
-            with torch.autocast(device_type=device, dtype=cfg.dtype if device == 'cuda' else torch.float32):
+            # Move to device (MpDeviceLoader already on device for TPU)
+            if not HAS_XLA:
+                x_batch_sam = x_batch_sam.to(device, dtype=torch.long)
+                y_batch_sam = y_batch_sam.to(device, dtype=torch.long)
+            else:
+                x_batch_sam = x_batch_sam.to(dtype=torch.long)
+                y_batch_sam = y_batch_sam.to(dtype=torch.long)
+            
+            if HAS_XLA:
                 logits, _ = model(x_batch_sam)
                 loss_perturbed = F.cross_entropy(
                     logits.flatten(0, 1),
                     y_batch_sam.flatten(),
                     label_smoothing=cfg.label_smoothing
                 )
+            else:
+                with torch.autocast(device_type=device, dtype=cfg.dtype if device == 'cuda' else torch.float32):
+                    logits, _ = model(x_batch_sam)
+                    loss_perturbed = F.cross_entropy(
+                        logits.flatten(0, 1),
+                        y_batch_sam.flatten(),
+                        label_smoothing=cfg.label_smoothing
+                    )
             loss_perturbed.backward()
             optimizer.second_step()
         else:
             base_opt.step()
             base_opt.zero_grad()
         
-        # Average accumulated loss
-        accumulated_loss /= cfg.gradient_accumulation_steps
+        # Mark XLA step (critical for TPU): tells XLA to finalize this training step
+        if HAS_XLA:
+            xm.mark_step()
+        
         tokens_processed += batch_tokens
         
         # Update EMA (infrequently, every 1-3% of total steps)
@@ -401,36 +463,66 @@ if __name__ == "__main__":
                 original_state = {k: v.clone() for k, v in model.state_dict().items()}
                 model.load_state_dict(ema_state_dict)
             
-            val_loss = 0.0
-            val_batches = 0
+            # Batch validation losses (avoid .item() calls until final reduction)
+            # TPU: validate on only 2 batches (full validation is too expensive with many mark_step calls)
+            # GPU: validate on full dataset
+            val_losses = []
+            max_val_batches = 2 if HAS_XLA else float('inf')
+            val_batch_count = 0
             with torch.no_grad():
                 # Use DataLoader for validation (more efficient)
                 for x_vbatch, y_vbatch in val_loader:
-                    x_vbatch = x_vbatch.to(device, dtype=torch.long)
-                    y_vbatch = y_vbatch.to(device, dtype=torch.long)
+                    if val_batch_count >= max_val_batches:
+                        break
+                    
+                    # MpDeviceLoader already on device; only dtype conversion needed on TPU
+                    if not HAS_XLA:
+                        x_vbatch = x_vbatch.to(device, dtype=torch.long)
+                        y_vbatch = y_vbatch.to(device, dtype=torch.long)
+                    else:
+                        x_vbatch = x_vbatch.to(dtype=torch.long)
+                        y_vbatch = y_vbatch.to(dtype=torch.long)
                     logits, _ = model(x_vbatch)
-                    val_loss += F.cross_entropy(
+                    val_loss_batch = F.cross_entropy(
                         logits.flatten(0, 1),
                         y_vbatch.flatten()
-                    ).item()
-                    val_batches += 1
+                    )
+                    # Store tensor, don't sync with .item()
+                    val_losses.append(val_loss_batch)
+                    val_batch_count += 1
             
-            val_loss /= max(val_batches, 1)
+            # Mark XLA step after validation (batch all validation graphs together)
+            if HAS_XLA:
+                xm.mark_step()
+            
+            # Single reduction at end (one device sync instead of per-batch syncs)
+            if val_losses:
+                val_loss = torch.stack(val_losses).mean().item()
+            else:
+                val_loss = float('inf')
             
             # Restore original weights before saving
             if cfg.use_ema and ema_state_dict is not None:
                 model.load_state_dict(original_state)
             
-            # Save best model
+            # Save best model (XLA-aware checkpoint if on TPU)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), "model/best_model.pt")
-                if cfg.use_ema:
-                    torch.save(ema_state_dict, "model/best_ema_model.pt")
+                if HAS_XLA:
+                    xm.save(model.state_dict(), "model/best_model.pt")
+                    if cfg.use_ema:
+                        xm.save(ema_state_dict, "model/best_ema_model.pt")
+                else:
+                    torch.save(model.state_dict(), "model/best_model.pt")
+                    if cfg.use_ema:
+                        torch.save(ema_state_dict, "model/best_ema_model.pt")
             
             model.train()
             elapsed = time.perf_counter() - start_time
+            # Average the buffered losses (single device sync)
+            train_loss = torch.stack(loss_buffer).mean().item() if loss_buffer else 0.0
+            loss_buffer.clear()
             throughput = tokens_processed / elapsed if elapsed > 0 else 0
-            print(f"Step {step+1:5d} | Train Loss {accumulated_loss:.4f} | Val Loss {val_loss:.4f} | Throughput {throughput:.0f} tok/s")
+            print(f"Step {step+1:5d} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} | Throughput {throughput:.0f} tok/s")
         
         step += 1
