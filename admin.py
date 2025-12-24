@@ -210,10 +210,18 @@ if __name__ == "__main__":
 
     # Train tokenizer on Tiny Shakespeare
     print("\n" + "=" * 50)
-    print("Training BPE Tokenizer...")
+    print("BPE Tokenizer...")
     print("=" * 50)
     tokenizer = BPETokenizer(cfg.vocab_size, min_frequency=2)
-    tokenizer.train(text, show_stats=True)
+    tokenizer_path = "tokenizer.json"
+    
+    if os.path.exists(tokenizer_path):
+        print(f"Loading tokenizer from {tokenizer_path}...")
+        tokenizer.load(tokenizer_path)
+    else:
+        print("Training tokenizer...")
+        tokenizer.train(text, show_stats=True)
+        tokenizer.save(tokenizer_path)
     
     print(f"Actual vocabulary size: {tokenizer.get_vocab_size()}")
 
@@ -358,9 +366,9 @@ if __name__ == "__main__":
                 # Save best model
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    torch.save(model.state_dict(), "best_model.pt")
+                    torch.save(model.state_dict(), "model/best_model.pt")
                     if cfg.use_ema:
-                        torch.save(ema_state_dict, "best_ema_model.pt")
+                        torch.save(ema_state_dict, "model/best_ema_model.pt")
                 
                 model.train()
                 print(f"Step {step+1:5d} | Train Loss {accumulated_loss:.4f} | Val Loss {val_loss:.4f}")

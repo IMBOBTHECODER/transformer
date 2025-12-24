@@ -148,6 +148,16 @@ class BPETokenizer:
         num_chars = len(text)
         return num_chars / max(num_tokens, 1)
 
+    def save(self, filepath):
+        """Save tokenizer to disk."""
+        self.tokenizer.save(filepath)
+        print(f"Tokenizer saved to {filepath}")
+
+    def load(self, filepath):
+        """Load tokenizer from disk."""
+        self.tokenizer = Tokenizer.from_file(filepath)
+        print(f"Tokenizer loaded from {filepath}")
+
     def _print_vocab_stats(self):
         """Print vocabulary statistics."""
         vocab = self.tokenizer.get_vocab()
