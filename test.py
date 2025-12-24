@@ -10,21 +10,28 @@ cfg.compile_mode = "max-autotune"
 # Initialize model with the same config
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
 
-# Load the EMA model weights - handle XLA device tags and compiled model state dict
+# Try to load the EMA model weights - handle XLA device tags and compiled model state dict
 # XLA-saved models need to be loaded to CPU first, then moved to target device
-if HAS_XLA:
-    # On TPU: load to CPU first to strip XLA storage tags
-    ema_state_dict = torch.load("model/best_ema_model.pt", map_location='cpu')
+if os.path.exists("model/best_ema_model.pt"):
+    try:
+        if HAS_XLA:
+            # On TPU: load to CPU first to strip XLA storage tags
+            ema_state_dict = torch.load("model/best_ema_model.pt", map_location='cpu')
+        else:
+            # On GPU/CPU: load directly to device
+            ema_state_dict = torch.load("model/best_ema_model.pt", map_location=device)
+        
+        # If state dict has "_orig_mod." prefix (from torch.compile), remove it
+        if any(k.startswith("_orig_mod.") for k in ema_state_dict.keys()):
+            ema_state_dict = {k.replace("_orig_mod.", ""): v for k, v in ema_state_dict.items()}
+        
+        model.load_state_dict(ema_state_dict)
+        print("Loaded EMA model weights")
+    except RuntimeError as e:
+        print(f"Warning: Could not load checkpoint (architecture mismatch): {e}")
+        print("Using randomly initialized model instead")
 else:
-    # On GPU/CPU: load directly to device
-    ema_state_dict = torch.load("model/best_ema_model.pt", map_location=device)
-
-# If state dict has "_orig_mod." prefix (from torch.compile), remove it
-if any(k.startswith("_orig_mod.") for k in ema_state_dict.keys()):
-    ema_state_dict = {k.replace("_orig_mod.", ""): v for k, v in ema_state_dict.items()}
-
-model.load_state_dict(ema_state_dict)
-model.eval()
+    print("No checkpoint found - using randomly initialized model")
 
 # Initialize tokenizer - load if exists, otherwise train and save
 tokenizer = BPETokenizer(cfg.vocab_size)
