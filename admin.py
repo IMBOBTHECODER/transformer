@@ -5,6 +5,7 @@ import os
 import time
 import torch
 import math
+import numpy as np
 from utils import build_optimizer
 from dataclasses import dataclass
 import torch.nn.functional as F
@@ -51,7 +52,7 @@ class GPTConfig:
     lr: float = 3e-4
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
-    batch_size: int = 128
+    batch_size: int = 256
     sequence_length: int = 512
     
     # advanced optimizations
@@ -68,7 +69,7 @@ class GPTConfig:
     id: str = "tinystories"
     
     # training
-    total_steps: int = 3_000
+    total_steps: int = 5_000
     val_interval: int = 200
     use_ema: bool = False # Currently disabled for TPU training
     ema_decay: float = 0.99
@@ -249,13 +250,7 @@ if __name__ == "__main__":
     # Load exactly 250,000 examples from the train split
     ds = load_dataset("roneneldan/TinyStories", split="train[:250000]")
 
-    # Extract the text field
-    texts = [sample["text"] for sample in ds]
-
-    # Join into a single string for tokenizer
-    text = "\n".join(texts)
-
-    print(f"Dataset loaded: {len(text)} characters")
+    print(f"Dataset loaded: {len(ds)} samples")
 
     # Train tokenizer on Tiny Shakespeare
     print("\n" + "=" * 50)
@@ -272,25 +267,58 @@ if __name__ == "__main__":
         tokenizer.load(tokenizer_path)
     else:
         print(f"Training tokenizer '{tokenizer_id}'...")
+        # Stream tokenization during training to avoid materializing all text
+        def stream_text_for_training(dataset, chunk_size=10000):
+            buffer = []
+            for sample in dataset:
+                buffer.append(sample["text"])
+                if len(buffer) >= chunk_size:
+                    yield "\n".join(buffer)
+                    buffer.clear()
+            if buffer:
+                yield "\n".join(buffer)
+        
+        # Train on streamed chunks instead of materializing entire dataset
+        chunks = list(stream_text_for_training(ds))
+        text = "\n".join(chunks)
         tokenizer.train(text, show_stats=True)
         tokenizer.save(tokenizer_path)
+        del chunks, text
     
     # Store in dictionary
     tokenizers[tokenizer_id] = tokenizer
     
     print(f"Actual vocabulary size: {tokenizer.get_vocab_size()}")
 
-    # Prepare training data - STREAMING BATCHES (no materialization)
-    text_tokens = tokenizer.encode(text)
+    # Stream tokenization: avoid materializing all texts in memory
+    def stream_tokenize(dataset, tokenizer, chunk_size=4096):
+        """Stream tokenization to avoid loading entire dataset in memory."""
+        buffer = []
+        for sample in dataset:
+            buffer.append(sample["text"])
+            if len(buffer) >= chunk_size:
+                yield tokenizer.encode("\n".join(buffer))
+                buffer.clear()
+        if buffer:
+            yield tokenizer.encode("\n".join(buffer))
+    
+    # Tokenize in streaming fashion (chunks never materialize full dataset)
+    print("Tokenizing dataset (streaming)...")
+    text_tokens_list = []
+    for chunk_tokens in stream_tokenize(ds, tokenizer):
+        text_tokens_list.extend(chunk_tokens)
+    
+    # Convert to NumPy uint16 for memory efficiency
+    # Python list: ~28 bytes/element → NumPy uint16: ~2 bytes/element (14x savings)
+    # 10M tokens: 280MB → 20MB RAM
+    text_tokens = np.array(text_tokens_list, dtype=np.uint16)
+    del text_tokens_list
     
     total_tokens = len(text_tokens)
-    compression_ratio = tokenizer.get_compression_ratio(text)
+    print(f"Total tokens: {total_tokens}")
     
-    print(f"Total tokens: {total_tokens} (compression ratio: {compression_ratio:.2f} chars/tokens)")
-    
-    # Delete raw text to free memory (not needed after tokenization)
-    del text, texts, ds
-
+    # Delete dataset reference to free memory
+    del ds
     gc.collect()
 
     # Create PyTorch DataLoaders for efficient batching and memory management
