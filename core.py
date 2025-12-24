@@ -5,14 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 
-# Try to import Flash Attention, fall back gracefully
-try:
-    from flash_attn import flash_attn_func
-    HAS_FLASH_ATTN = True
-except ImportError:
-    HAS_FLASH_ATTN = False
-    flash_attn_func = None
-
 # =========================================================
 # TOKENIZER (RUST-BASED FAST BPE WITH IMPROVEMENTS)
 # =========================================================
@@ -54,7 +46,7 @@ class BPETokenizer:
         # Create trainer with optimized parameters
         trainer = trainers.BpeTrainer(
             vocab_size=self.vocab_size,
-            min_frequency=self.min_frequency,  # Only merge tokens that appear 2+ times
+            min_frequency=min(self.min_frequency, 5),  # Increase to 5-10 range for better compression
             special_tokens=[
                 "<pad>",      # ID 0
                 "<unk>",      # ID 1
@@ -168,45 +160,63 @@ class BPETokenizer:
         print(f"  Token frequency distribution analysis completed")
 
 # =========================================================
+# RMSNorm (RMS Layer Normalization)
+# =========================================================
+class RMSNorm(nn.Module):
+    """RMS Layer Normalization using PyTorch's built-in (≥2.1)."""
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
+
+# =========================================================
 # RoPE
 # =========================================================
 class RoPE(nn.Module):
-    def __init__(self, head_dim):
+    def __init__(self, head_dim, max_seq_len=2048, yarn_scale=1.0):
         super().__init__()
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._sin_cos_cache = {}
-
-    def forward(self, x):
-        # x: (B, H, T, D)
-        T = x.size(2)
-        cache_key = (T, x.device, x.dtype)
         
-        # Use cache for sin/cos if available (inference only - reduces memory during training)
-        if cache_key in self._sin_cos_cache:
-            sin, cos = self._sin_cos_cache[cache_key]
+        # YaRN: extend context length beyond training
+        self.yarn_scale = yarn_scale
+        
+        # Precompute sin/cos for all positions (cache as buffers, not dict)
+        freqs = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), inv_freq)
+        self.register_buffer("sin", freqs.sin(), persistent=False)
+        self.register_buffer("cos", freqs.cos(), persistent=False)
+
+    def forward(self, x, start_pos=0, inference=False):
+        # x: (B, T, H, D) - applies RoPE with absolute positions for correct cache alignment
+        T = x.size(1)
+        pos = torch.arange(start_pos, start_pos + T, dtype=torch.float32, device=x.device)
+        
+        # YaRN: inference-only frequency interpolation for extended context during generation
+        if inference and self.yarn_scale > 1.0:
+            # Smooth interpolation: blend old and new frequencies (inference only)
+            t = pos / self.yarn_scale
+            t = torch.clamp(t, 0, pos.max())  # Avoid out-of-bounds
+            sin_cache = torch.sin(torch.outer(t, self.inv_freq))
+            cos_cache = torch.cos(torch.outer(t, self.inv_freq))
         else:
-            inv_freq = self.inv_freq.to(x.dtype)
-            freqs = torch.outer(
-                torch.arange(T, device=x.device, dtype=x.dtype),
-                inv_freq
-            )
-            sin, cos = freqs.sin(), freqs.cos()
-            # Cache results only during inference
-            if not self.training and len(self._sin_cos_cache) < 10:
-                self._sin_cos_cache[cache_key] = (sin, cos)
-
-        # Optimized RoPE: reshape sin/cos for efficient broadcasting
-        # (T, D/2) -> (1, 1, T, D/2) for proper broadcasting with (B, H, T, D)
-        sin = sin.unsqueeze(0).unsqueeze(0)
-        cos = cos.unsqueeze(0).unsqueeze(0)
+            # Use precomputed buffers for training (faster, always used during training)
+            sin_cache = self.sin[start_pos:start_pos+T]
+            cos_cache = self.cos[start_pos:start_pos+T]
         
-        # Apply RoPE with in-place operations for memory efficiency
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return torch.cat(
-            [x1 * cos - x2 * sin, x1 * sin + x2 * cos],
-            dim=-1
-        )
+        # Cast to input dtype and reshape for broadcasting
+        sin = sin_cache.unsqueeze(0).unsqueeze(0).to(x.dtype)  # (1, 1, T, D/2)
+        cos = cos_cache.unsqueeze(0).unsqueeze(0).to(x.dtype)  # (1, 1, T, D/2)
+        
+        # Apply RoPE: non-in-place for autograd safety
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        rotated = torch.empty_like(x)
+        rotated[..., ::2] = x1 * cos - x2 * sin
+        rotated[..., 1::2] = x1 * sin + x2 * cos
+        return rotated
 
 # =========================================================
 # ATTENTION (FLASH + KV)
@@ -215,53 +225,90 @@ class Attention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_heads // 2
         self.head_dim = cfg.d_model // cfg.n_heads
-        self.use_flash = cfg.use_flash_attention
+        assert cfg.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+        self.n_rep = cfg.n_heads // self.n_kv_heads  # Repeat factor for KV
         
-        # Fused QKV projection: single linear layer for all three
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=True)
+        # Separate Q and KV projections for GQA
+        self.q_proj = nn.Linear(cfg.d_model, cfg.n_heads * self.head_dim, bias=True)
+        self.kv_proj = nn.Linear(cfg.d_model, 2 * self.n_kv_heads * self.head_dim, bias=True)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
         
-        # Use dropout from config instead of hardcoded fallback
-        dropout = cfg.dropout
-        self.attn_drop = nn.Dropout(dropout)
-        self.proj_drop = nn.Dropout(dropout)
-        self.rope = RoPE(self.head_dim)
-        self.has_flash = HAS_FLASH_ATTN
+        self.attn_drop = nn.Dropout(cfg.dropout)
+        self.proj_drop = nn.Dropout(cfg.dropout)
+        # YaRN: use yarn_scale > 1.0 for longer context during generation
+        yarn_scale = getattr(cfg, 'yarn_scale', 1.0)
+        self.rope = RoPE(self.head_dim, max_seq_len=cfg.sequence_length, yarn_scale=yarn_scale)
 
     def forward(self, x, cache=None):
         B, T, C = x.shape
 
-        # Fused QKV projection: single matrix mult for all three
-        qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)  # Split into Q, K, V
+        # Get absolute position from cache (0 if no cache)
+        pos = cache[2] if cache is not None else 0
+        inference = cache is not None  # YaRN only during inference
+
+        # Separate Q and KV projections
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)  # (B, T, n_heads, D)
+        kv = self.kv_proj(x).view(B, T, 2 * self.n_kv_heads, self.head_dim)
+        k, v = kv[..., :self.n_kv_heads, :], kv[..., self.n_kv_heads:, :]  # (B, T, n_kv_heads, D)
         
-        # Reshape to (B, H, T, D) after splitting
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Fuse RoPE: apply immediately after projection before attention
-        q = self.rope(q)  # RoPE on Q
-        k = self.rope(k)  # RoPE on K
-
-        # Handle cache with proper dtype
+        # Apply RoPE with absolute positions BEFORE transpose (more efficient)
+        q = self.rope(q, start_pos=pos, inference=inference)
+        k = self.rope(k, start_pos=pos, inference=inference)
+        
+        # Handle cache: keep in (B, T, H_kv, D) format for efficiency
         if cache is not None:
-            if "k" in cache:
-                k = torch.cat([cache["k"], k], dim=2)
-                v = torch.cat([cache["v"], v], dim=2)
-            cache = {"k": k.detach(), "v": v.detach()}
-
-        # Use Flash Attention if available and enabled, else fall back to scaled_dot_product_attention
-        if self.use_flash and self.has_flash:
-            # Flash Attention: 2-3x faster, requires (B, T, H, D) format
-            out = flash_attn_func(q, k, v, causal=True)
+            k_cache, v_cache, _ = cache
+            k_cache[:, pos:pos+T, :, :] = k  # k in (B, T, H_kv, D)
+            v_cache[:, pos:pos+T, :, :] = v
+            k, v = k_cache, v_cache
+            new_pos = pos + T
         else:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            new_pos = None
         
-        out = self.attn_drop(out)
+        # Transpose to (B, H, T, D) only for SDPA
+        q = q.transpose(1, 2)  # (B, T, H, D) -> (B, H, T, D)
+        k = k.transpose(1, 2)  # (B, T, H_kv, D) -> (B, H_kv, T, D)
+        v = v.transpose(1, 2)  # (B, T, H_kv, D) -> (B, H_kv, T, D)
+
+        # Use PyTorch SDPA with built-in GQA broadcasting
+        # SDPA automatically broadcasts (B, H_kv, T, D) KV to match (B, H, T, D) Q
+        out = F.scaled_dot_product_attention(
+            q, k, v,  # k,v stay as (B, H_kv, T, D), q is (B, H, T, D)
+            is_causal=True,
+            dropout_p=self.proj_drop.p if self.training else 0.0
+        )
         out = out.transpose(1, 2).reshape(B, T, C)
-        return self.proj_drop(self.out_proj(out)), cache
+        return self.proj_drop(self.out_proj(out)), (k_cache, v_cache, new_pos) if cache is not None else None
+
+# =========================================================
+# FUSED MLP (gate+value projected together, fused by torch.compile)
+# =========================================================
+class FusedMLP(nn.Module):
+    """Fused MLP: Linear(2x) → chunk → activation → multiply → Linear (optimized by torch.compile)."""
+    def __init__(self, d_model, hidden_dim, activation="swiglu"):
+        super().__init__()
+        self.fc = nn.Linear(d_model, 2 * hidden_dim, bias=True)
+        self.proj = nn.Linear(hidden_dim, d_model, bias=True)
+        self.activation = activation
+        self.act = (
+            activation_fn(activation)
+            if activation not in ("swiglu", "geglu", "reglu")
+            else None
+        )
+    
+    def forward(self, x):
+        """Single fused forward for torch.compile optimization."""
+        u, v = self.fc(x).chunk(2, dim=-1)
+        if self.activation == "swiglu":
+            return self.proj(F.silu(u) * v)
+        elif self.activation == "geglu":
+            return self.proj(F.gelu(u) * v)
+        elif self.activation == "reglu":
+            return self.proj(F.relu(u) * v)
+        else:
+            return self.proj(self.act(u) * v)
 
 # =========================================================
 # TRANSFORMER BLOCK
@@ -269,27 +316,23 @@ class Attention(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = RMSNorm(cfg.d_model)
+        self.ln2 = RMSNorm(cfg.d_model)
         self.attn = Attention(cfg)
         self.gradient_checkpointing = cfg.gradient_checkpointing
         
-        # Use dropout from config
         dropout = cfg.dropout
         self.drop1 = nn.Dropout(dropout)
         self.drop2 = nn.Dropout(dropout)
 
-        hidden = cfg.mlp_ratio * cfg.d_model
-        # Use bias for better expressiveness
-        self.fc = nn.Linear(cfg.d_model, hidden * 2, bias=True)
-        self.proj = nn.Linear(hidden, cfg.d_model, bias=True)
-
-        self.activation = cfg.activation
-        self.act = (
-            activation_fn(cfg.activation)
-            if cfg.activation not in ("swiglu", "geglu", "reglu")
-            else None
-        )
+        # Align hidden dim to tensor cores (multiples of 64)
+        def round_to(x, m=64):
+            return (x + m - 1) // m * m
+        
+        hidden_dim = round_to(int(2/3 * cfg.mlp_ratio * cfg.d_model))
+        # Fused MLP: Linear(2x) → chunk → activation → multiply → Linear
+        # torch.compile fuses all operations into minimal kernels
+        self.mlp = FusedMLP(cfg.d_model, hidden_dim, cfg.activation)
 
     def forward(self, x, cache=None):
         # Attention block with optional gradient checkpointing
@@ -303,35 +346,15 @@ class Block(nn.Module):
             a, cache = self.attn(self.ln1(x), cache)
         x = x + self.drop1(a)
 
-        # Fused SwiGLU / gated activation with optional gradient checkpointing
+        # Fused MLP with gradient checkpointing
         if self.gradient_checkpointing and self.training:
             def mlp_forward(x_):
-                h_input = self.ln2(x_)
-                u, v = self.fc(h_input).chunk(2, dim=-1)
-                if self.activation == "swiglu":
-                    h = F.silu(u) * v
-                elif self.activation == "geglu":
-                    h = F.gelu(u) * v
-                elif self.activation == "reglu":
-                    h = F.relu(u) * v
-                else:
-                    h = self.act(u)
-                return self.proj(h)
+                return self.mlp(self.ln2(x_))
             h = torch.utils.checkpoint.checkpoint(
                 mlp_forward, x, use_reentrant=False
             )
         else:
-            h_input = self.ln2(x)
-            u, v = self.fc(h_input).chunk(2, dim=-1)
-            if self.activation == "swiglu":
-                h = F.silu(u) * v
-            elif self.activation == "geglu":
-                h = F.gelu(u) * v
-            elif self.activation == "reglu":
-                h = F.relu(u) * v
-            else:
-                h = self.act(u)
-            h = self.proj(h)
+            h = self.mlp(self.ln2(x))
 
         x = x + self.drop2(h)
         return x, cache
@@ -345,7 +368,7 @@ class GPT(nn.Module):
         self.cfg = cfg
         self.tok = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.ln_f = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.head.weight = self.tok.weight
         self.apply(self._init)
@@ -360,6 +383,21 @@ class GPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=self.cfg.init_std)
 
+    def allocate_kv_cache(self, batch_size, max_seq_len, device, dtype):
+        """Preallocate KV cache for efficient inference with position tracking."""
+        cache = []
+        n_kv_heads = self.cfg.n_heads // 2  # GQA: hardcoded to half the query heads
+        head_dim = self.cfg.d_model // self.cfg.n_heads
+        
+        for _ in range(self.cfg.n_layers):
+            # Cache in (B, T, H_kv, D) format for efficient indexing
+            k_cache = torch.zeros(batch_size, max_seq_len, n_kv_heads, head_dim,
+                                 device=device, dtype=dtype)
+            v_cache = torch.zeros_like(k_cache)
+            pos = 0  # Track current position in cache
+            cache.append((k_cache, v_cache, pos))
+        return cache
+
     def forward(self, idx, cache=None):
         x = self.tok(idx)
         
@@ -368,7 +406,7 @@ class GPT(nn.Module):
                 x, _ = blk(x, None)
             return self.head(self.ln_f(x)), None
         
-        # With cache
+        # With preallocated cache
         new_cache = []
         for i, blk in enumerate(self.blocks):
             x, blk_cache = blk(x, cache[i])
