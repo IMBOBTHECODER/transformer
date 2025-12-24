@@ -17,7 +17,8 @@ except ImportError:
 # TOKENIZER (RUST-BASED FAST BPE WITH IMPROVEMENTS)
 # =========================================================
 class BPETokenizer:
-    def __init__(self, vocab_size, min_frequency=2):
+    def __init__(self, vocab_size, min_frequency=2, tokenizer_id="default"):
+        self.tokenizer_id = tokenizer_id  # Identifier for this tokenizer
         self.vocab_size = vocab_size
         self.min_frequency = min_frequency  # Filter rare tokens during training
         
@@ -86,8 +87,7 @@ class BPETokenizer:
         Returns:
             List of token IDs
         """
-        encoding = self.tokenizer.encode(text, add_special_tokens=False)
-        ids = encoding.ids
+        ids = self.tokenizer.encode(text, add_special_tokens=False).ids
         
         if add_special_tokens:
             ids = [self.bos_id] + ids + [self.eos_id]
@@ -151,31 +151,21 @@ class BPETokenizer:
     def save(self, filepath):
         """Save tokenizer to disk."""
         self.tokenizer.save(filepath)
-        print(f"Tokenizer saved to {filepath}")
+        print(f"Tokenizer '{self.tokenizer_id}' saved to {filepath}")
 
     def load(self, filepath):
-        """Load tokenizer from disk."""
+        """Load tokenizer from disk and preserve tokenizer_id."""
         self.tokenizer = Tokenizer.from_file(filepath)
-        print(f"Tokenizer loaded from {filepath}")
+        print(f"Tokenizer '{self.tokenizer_id}' loaded from {filepath}")
 
     def _print_vocab_stats(self):
         """Print vocabulary statistics."""
         vocab = self.tokenizer.get_vocab()
         actual_size = len(vocab)
-        print(f"\nTokenizer Statistics:")
+        print(f"\nTokenizer Statistics [{self.tokenizer_id}]:")
         print(f"  Vocabulary size: {actual_size} / {self.vocab_size}")
         print(f"  Special tokens: pad={self.pad_id}, unk={self.unk_id}, bos={self.bos_id}, eos={self.eos_id}")
         print(f"  Token frequency distribution analysis completed")
-
-    def save(self, path):
-        """Save tokenizer to disk."""
-        self.tokenizer.save(path)
-        print(f"Tokenizer saved to {path}")
-
-    def load(self, path):
-        """Load tokenizer from disk."""
-        self.tokenizer = Tokenizer.from_file(path)
-        print(f"Tokenizer loaded from {path}")
 
 # =========================================================
 # RoPE

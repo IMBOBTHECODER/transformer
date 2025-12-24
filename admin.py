@@ -66,8 +66,8 @@ if device == "cpu":
     cfg.dtype = torch.float32
 torch.set_float32_matmul_precision("high")
 
-# Initialize tokenizer at module level for imports
-tokenizer = None
+# Initialize tokenizers at module level for imports
+tokenizers = {}  # Dictionary to store multiple tokenizers by ID
 
 # =========================================================
 # PYTORCH DATASET AND DATALOADER
@@ -212,16 +212,22 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("BPE Tokenizer...")
     print("=" * 50)
-    tokenizer = BPETokenizer(cfg.vocab_size, min_frequency=2)
-    tokenizer_path = "tokenizer.json"
+    
+    # Create tokenizer with an ID
+    tokenizer_id = "tinystories"
+    tokenizer = BPETokenizer(cfg.vocab_size, min_frequency=2, tokenizer_id=tokenizer_id)
+    tokenizer_path = f"tokenizer_{tokenizer_id}.json"
     
     if os.path.exists(tokenizer_path):
-        print(f"Loading tokenizer from {tokenizer_path}...")
+        print(f"Loading tokenizer '{tokenizer_id}' from {tokenizer_path}...")
         tokenizer.load(tokenizer_path)
     else:
-        print("Training tokenizer...")
+        print(f"Training tokenizer '{tokenizer_id}'...")
         tokenizer.train(text, show_stats=True)
         tokenizer.save(tokenizer_path)
+    
+    # Store in dictionary
+    tokenizers[tokenizer_id] = tokenizer
     
     print(f"Actual vocabulary size: {tokenizer.get_vocab_size()}")
 
@@ -230,9 +236,8 @@ if __name__ == "__main__":
     total_tokens = len(text_tokens)
     compression_ratio = tokenizer.get_compression_ratio(text)
     
-    print(f"Total tokens: {total_tokens}")
-    print(f"Compression ratio: {compression_ratio:.2f}x (chars/tokens)")
-    
+    print(f"Total tokens: {total_tokens} (compression ratio: {compression_ratio:.2f} chars/tokens)")
+
     # Create PyTorch DataLoaders for efficient batching and memory management
     train_loader, val_loader = create_data_loaders(
         text_tokens, 
