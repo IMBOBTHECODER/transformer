@@ -1,5 +1,6 @@
 # admin.py
 from core import *
+import gc
 import os
 import time
 import torch
@@ -25,7 +26,7 @@ except ImportError:
 @dataclass
 class GPTConfig:
     # main
-    vocab_size: int = 16000
+    vocab_size: int = 18_000
     d_model: int = 384
     n_heads: int = 6
     n_layers: int = 8
@@ -64,9 +65,10 @@ class GPTConfig:
 
     # init
     init_std: float = 0.02
+    id: str = "tinystories"
     
     # training
-    total_steps: int = 2000
+    total_steps: int = 3_000
     val_interval: int = 200
     use_ema: bool = False # Currently disabled for TPU training
     ema_decay: float = 0.99
@@ -244,8 +246,8 @@ if __name__ == "__main__":
     # Load dataset
     print("Loading dataset...")
 
-    # Load exactly 150,000 examples from the train split
-    ds = load_dataset("roneneldan/TinyStories", split="train[:150000]")
+    # Load exactly 250,000 examples from the train split
+    ds = load_dataset("roneneldan/TinyStories", split="train[:250000]")
 
     # Extract the text field
     texts = [sample["text"] for sample in ds]
@@ -261,7 +263,7 @@ if __name__ == "__main__":
     print("=" * 50)
     
     # Create tokenizer with an ID (use min_frequency 8 for better compression)
-    tokenizer_id = "tinystories"
+    tokenizer_id = cfg.id
     tokenizer = BPETokenizer(cfg.vocab_size, min_frequency=8, tokenizer_id=tokenizer_id)
     tokenizer_path = f"tokenizer_{tokenizer_id}.json"
     
@@ -285,6 +287,11 @@ if __name__ == "__main__":
     compression_ratio = tokenizer.get_compression_ratio(text)
     
     print(f"Total tokens: {total_tokens} (compression ratio: {compression_ratio:.2f} chars/tokens)")
+    
+    # Delete raw text to free memory (not needed after tokenization)
+    del text, texts, ds
+
+    gc.collect()
 
     # Create PyTorch DataLoaders for efficient batching and memory management
     train_loader, val_loader = create_data_loaders(
@@ -508,14 +515,17 @@ if __name__ == "__main__":
             # Save best model (XLA-aware checkpoint if on TPU)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                # Ensure model directory exists
+                os.makedirs("model", exist_ok=True)
+                
                 if HAS_XLA:
-                    xm.save(model.state_dict(), "model/best_model.pt")
-                    if cfg.use_ema:
-                        xm.save(ema_state_dict, "model/best_ema_model.pt")
+                    xm.save(model.state_dict(), f"model/best_model_{cfg.id}.pt")
+                    if cfg.use_ema and ema_state_dict is not None:
+                        xm.save(ema_state_dict, f"model/best_ema_model_{cfg.id}.pt")
                 else:
-                    torch.save(model.state_dict(), "model/best_model.pt")
-                    if cfg.use_ema:
-                        torch.save(ema_state_dict, "model/best_ema_model.pt")
+                    torch.save(model.state_dict(), f"model/best_model_{cfg.id}.pt")
+                    if cfg.use_ema and ema_state_dict is not None:
+                        torch.save(ema_state_dict, f"model/best_ema_model_{cfg.id}.pt")
             
             model.train()
             elapsed = time.perf_counter() - start_time

@@ -7,35 +7,48 @@ import argparse
 
 cfg.compile_mode = "max-autotune"
 
+# Parse command-line arguments (including checkpoint selection)
+parser = argparse.ArgumentParser(description="Generate text using the trained transformer model")
+parser.add_argument("prompt", nargs="?", default=None, help="Text prompt to start generation")
+parser.add_argument("steps", nargs="?", type=int, default=100, help="Number of tokens to generate (default: 100)")
+parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for sampling (default: 0.8)")
+parser.add_argument("--top_k", type=int, default=30, help="Top-k for sampling (default: 30)")
+parser.add_argument("--checkpoint", type=str, default="ema", choices=["ema", "model"], 
+                    help="Which checkpoint to load: 'ema' (best_ema_model.pt) or 'model' (best_model.pt) (default: ema)")
+
+args = parser.parse_args()
+
 # Initialize model with the same config
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
 
-# Try to load the EMA model weights - handle XLA device tags and compiled model state dict
-# XLA-saved models need to be loaded to CPU first, then moved to target device
-if os.path.exists("model/best_ema_model.pt"):
+# Try to load the specified checkpoint
+checkpoint_name = "best_ema_model.pt" if args.checkpoint == "ema" else "best_model.pt"
+checkpoint_path = f"model/{checkpoint_name}"
+
+if os.path.exists(checkpoint_path):
     try:
         if HAS_XLA:
             # On TPU: load to CPU first to strip XLA storage tags
-            ema_state_dict = torch.load("model/best_ema_model.pt", map_location='cpu')
+            state_dict = torch.load(checkpoint_path, map_location='cpu')
         else:
             # On GPU/CPU: load directly to device
-            ema_state_dict = torch.load("model/best_ema_model.pt", map_location=device)
+            state_dict = torch.load(checkpoint_path, map_location=device)
         
         # If state dict has "_orig_mod." prefix (from torch.compile), remove it
-        if any(k.startswith("_orig_mod.") for k in ema_state_dict.keys()):
-            ema_state_dict = {k.replace("_orig_mod.", ""): v for k, v in ema_state_dict.items()}
+        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         
-        model.load_state_dict(ema_state_dict)
-        print("Loaded EMA model weights")
+        model.load_state_dict(state_dict)
+        print(f"Loaded {args.checkpoint.upper()} checkpoint from {checkpoint_path}")
     except RuntimeError as e:
         print(f"Warning: Could not load checkpoint (architecture mismatch): {e}")
         print("Using randomly initialized model instead")
 else:
-    print("No checkpoint found - using randomly initialized model")
+    print(f"No {args.checkpoint} checkpoint found at {checkpoint_path} - using randomly initialized model")
 
 # Initialize tokenizer - load if exists, otherwise train and save
 tokenizer = BPETokenizer(cfg.vocab_size)
-tokenizer_path = "tokenizer.json"
+tokenizer_path = f"tokenizer_{cfg.tokenizer_id}.json"
 
 if os.path.exists(tokenizer_path):
     print(f"Loading tokenizer from {tokenizer_path}...")
@@ -50,19 +63,10 @@ else:
     tokenizer.train(text)
     tokenizer.save(tokenizer_path)
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Generate text using the trained transformer model")
-parser.add_argument("prompt", nargs="?", default=None, help="Text prompt to start generation")
-parser.add_argument("steps", nargs="?", type=int, default=100, help="Number of tokens to generate (default: 100)")
-parser.add_argument("--temperature", type=float, default=0.8, help="Temperature for sampling (default: 0.8)")
-parser.add_argument("--top_k", type=int, default=30, help="Top-k for sampling (default: 30)")
-
-args = parser.parse_args()
-
 # Use command-line arguments or prompt for input
 if args.prompt is None:
-    print("Usage: python test.py \"Your prompt here\" [steps]")
-    print("Example: python test.py \"Once upon a time\" 100")
+    print("Usage: python test.py \"Your prompt here\" [steps] [--checkpoint {ema,model}]")
+    print("Example: python test.py \"Once upon a time\" 100 --checkpoint model")
     print()
     prompt = input("Enter a prompt: ").strip()
 else:
@@ -80,7 +84,22 @@ with torch.no_grad():
     prompt_tokens = tokenizer.encode(prompt)
     prompt_tensor = torch.tensor([prompt_tokens], device=device, dtype=torch.long)
     
-    # Generate new tokens
-    generated = generate(model, prompt_tensor, steps=steps, temperature=temperature, top_k=top_k)
+    # Allocate KV cache for faster generation (O(n) instead of O(n²) complexity)
+    # Cache is preallocated for prompt + generated tokens
+    max_seq_len = len(prompt_tokens) + steps
+    cache = model.allocate_kv_cache(
+        batch_size=1,
+        max_seq_len=max_seq_len,
+        device=device,
+        dtype=cfg.dtype
+    )
+    
+    # Prefill cache with prompt tokens (uses cache but only for precomputation)
+    with torch.no_grad():
+        _, cache = model(prompt_tensor, cache=cache)
+    
+    # Generate new tokens with cached KV (single token per step)
+    generated = generate(model, prompt_tensor, steps=steps, temperature=temperature, 
+                        top_k=top_k, use_cache=True)
     output_text = tokenizer.decode(generated[0].tolist())
     print(output_text)
