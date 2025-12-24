@@ -78,7 +78,7 @@ cfg = GPTConfig()
 
 # Device selection: TPU > GPU > CPU
 if HAS_XLA:
-    device = xm.xla_device()  # Use TPU via XLA
+    device = torch_xla.device  # Use TPU via XLA
     cfg.dtype = torch.bfloat16  # BF16 optimal for TPU
     cfg.compile = False  # TPU: disable torch.compile (XLA is implicit, torch.compile adds overhead)
     cfg.dropout = 0.0  # TPU: disable dropout (interferes with XLA fusion, not needed for training stability)

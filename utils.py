@@ -106,13 +106,22 @@ class SAM:
 # =========================================================
 def build_optimizer(model, cfg):
     groups = param_groups(model, cfg.weight_decay)
+    
+    # Check if running on TPU (XLA)
+    try:
+        import torch_xla.core.xla_model as xm
+        has_xla = True
+    except ImportError:
+        has_xla = False
 
     if cfg.optimizer == "adamw":
+        # TPU: disable fused (not supported on XLA devices)
+        # GPU/CPU: use fused for performance
         opt = torch.optim.AdamW(
             groups,
             lr=cfg.lr,
             betas=cfg.betas,
-            fused=True
+            fused=not has_xla  # Disable fused on TPU
         )
     elif cfg.optimizer == "lion":
         opt = Lion(groups, lr=cfg.lr, wd=cfg.weight_decay)
