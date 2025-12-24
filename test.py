@@ -7,8 +7,13 @@ import os
 # Initialize model with the same config
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
 
-# Load the EMA model weights
+# Load the EMA model weights - handle compiled model state dict
 ema_state_dict = torch.load("best_ema_model.pt", map_location=device)
+
+# If state dict has "_orig_mod." prefix (from torch.compile), remove it
+if any(k.startswith("_orig_mod.") for k in ema_state_dict.keys()):
+    ema_state_dict = {k.replace("_orig_mod.", ""): v for k, v in ema_state_dict.items()}
+
 model.load_state_dict(ema_state_dict)
 model.eval()
 
@@ -32,7 +37,7 @@ else:
 # Now use the model for inference
 with torch.no_grad():
     # Example: generate text from a prompt
-    prompt = "She touched me and said"  
+    prompt = "Once upon a time"  
     prompt_tokens = tokenizer.encode(prompt)
     prompt_tensor = torch.tensor([prompt_tokens], device=device, dtype=torch.long)
     
