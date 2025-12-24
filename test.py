@@ -37,11 +37,12 @@ else:
 # Now use the model for inference
 with torch.no_grad():
     # Example: generate text from a prompt
-    prompt = "Once upon a time"  
+    prompt = input("Enter a prompt: ")
+    steps = int(input("Enter number of tokens to generate: "))
     prompt_tokens = tokenizer.encode(prompt)
     prompt_tensor = torch.tensor([prompt_tokens], device=device, dtype=torch.long)
     
-    # Generate 50 new tokens
-    generated = generate(model, prompt_tensor, steps=100, temperature=0.8, top_k=30)
+    # Generate new tokens
+    generated = generate(model, prompt_tensor, steps=steps, temperature=0.8, top_k=30)
     output_text = tokenizer.decode(generated[0].tolist())
     print(output_text)
