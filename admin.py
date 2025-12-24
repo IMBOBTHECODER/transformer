@@ -29,7 +29,7 @@ class GPTConfig:
     # main
     vocab_size: int = 18_000
     d_model: int = 384
-    n_heads: int = 6
+    n_heads: int = 8
     n_layers: int = 8
     mlp_ratio: int = 4
     yarn_scale: float = 1.0  # YaRN: scale for RoPE max_seq_len during generation
@@ -402,10 +402,10 @@ if __name__ == "__main__":
         batch_tokens = x_batch.numel()
         
         # Set learning rate from precomputed schedule (Python list, no device sync)
-        # TPU: update every 4 steps to reduce recompilation overhead (minimal accuracy loss)
-        if step % 4 == 0:
-            base_opt = optimizer.base if cfg.sam else optimizer
-            base_opt.param_groups[0]['lr'] = lr_schedule[step]
+        # Update every step (outside graph): TPU hates control flow depending on step count
+        base_opt = optimizer.base if cfg.sam else optimizer
+        lr = lr_schedule[step]
+        base_opt.param_groups[0]['lr'] = lr
         
         # Forward pass (NO autocast on TPU - XLA handles dtype natively)
         if HAS_XLA:
