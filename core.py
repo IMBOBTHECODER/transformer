@@ -1,11 +1,18 @@
 # core.py
+
+# Model
 import torch
 from utils import activation_fn
 import torch.nn as nn
 import torch.nn.functional as F
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers
 
-# Try to import XLA for TPU support
+# Tokenizer
+from tokenizers.processors import ByteLevel as ByteLevelProcessor
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+
+
+# TPU support
 try:
     import torch_xla.core.xla_model as xm
     HAS_XLA = True
@@ -21,7 +28,7 @@ def compile_model(model, mode='reduce-overhead'):
     else: return torch.compile(model, mode=mode)
 
 # =========================================================
-# TOKENIZER (RUST-BASED FAST BPE WITH IMPROVEMENTS)
+# TOKENIZER
 # =========================================================
 class BPETokenizer:
     def __init__(self, vocab_size, min_frequency=2, tokenizer_id="default"):
@@ -31,21 +38,16 @@ class BPETokenizer:
         
         # Define special tokens (will be set by tokenizer or train())
         # Do NOT hardcode IDs - they depend on tokenizer state
-        self.pad_id = None
-        self.unk_id = None
-        self.bos_id = None
-        self.eos_id = None
+        self.pad_id,self.unk_id, self.bos_id, self.eos_id = None,None,None,None
         
         # Use HuggingFace tokenizers (Rust-based, production-grade)
         self.tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
         self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         
         # Add decoders for proper text reconstruction
-        from tokenizers.processors import ByteLevel as ByteLevelProcessor
         self.tokenizer.post_processor = ByteLevelProcessor(trim_offsets=True)
         
         # Add decoder (inverse of ByteLevel encoding)
-        from tokenizers.decoders import ByteLevel as ByteLevelDecoder
         self.tokenizer.decoder = ByteLevelDecoder()
         
         # Cache for vocab stats
@@ -53,7 +55,7 @@ class BPETokenizer:
 
     def train(self, text, show_stats=True):
         """
-        Train BPE tokenizer with improved parameters for better compression.
+        Train BPE tokenizer on given text.
         
         Args:
             text: Training text
@@ -74,8 +76,8 @@ class BPETokenizer:
             initial_alphabet=[chr(i) for i in range(256)],  # Full byte alphabet
         )
         
-        # Split text into chunks for better BPE training and memory efficiency
-        chunk_size = 10_000_000  # 10M character chunks
+        # Split into chunks for better training and memory efficiency
+        chunk_size = 16_777_216 # 24 bits integer
         chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
         
         # Train on iterator of chunks (better merge quality and memory usage)
@@ -130,7 +132,7 @@ class BPETokenizer:
 
     def decode(self, ids, skip_special_tokens=True):
         """
-        Decode token IDs back to text with improved handling.
+        Decode token IDs back to text.
         
         Args:
             ids: List of token IDs
@@ -176,7 +178,7 @@ class BPETokenizer:
     def save(self, filepath):
         """Save tokenizer to disk."""
         self.tokenizer.save(filepath)
-        print(f"Tokenizer '{self.tokenizer_id}' saved to {filepath}")
+        print(f"Saved tokenizer '{self.tokenizer_id}' to {filepath}")
 
     def load(self, filepath):
         """Load tokenizer from disk and preserve tokenizer_id."""
@@ -186,7 +188,7 @@ class BPETokenizer:
         self.unk_id = self.tokenizer.token_to_id("<unk>")
         self.bos_id = self.tokenizer.token_to_id("<bos>")
         self.eos_id = self.tokenizer.token_to_id("<eos>")
-        print(f"Tokenizer '{self.tokenizer_id}' loaded from {filepath}")
+        print(f"Loaded tokenizer '{self.tokenizer_id}' from {filepath}")
 
     def _print_vocab_stats(self):
         """Print vocabulary statistics."""
@@ -197,6 +199,7 @@ class BPETokenizer:
         # Safely print special token IDs (may be None if not in vocab)
         print(f"  Special tokens: pad={self.pad_id}, unk={self.unk_id}, bos={self.bos_id}, eos={self.eos_id}")
         print(f"  Token frequency distribution analysis completed")
+
 
 # =========================================================
 # RMSNorm (RMS Layer Normalization)
@@ -210,6 +213,7 @@ class RMSNorm(nn.Module):
     
     def forward(self, x):
         return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
+
 
 # =========================================================
 # RoPE
@@ -293,6 +297,7 @@ class RoPE(nn.Module):
         rotated[..., 1::2] = x1 * sin + x2 * cos
         return rotated
 
+
 # =========================================================
 # ATTENTION (FLASH + KV)
 # =========================================================
@@ -303,12 +308,8 @@ class Attention(nn.Module):
         # TPU: Use full MHA (n_kv_heads = n_heads, no KV repetition)
         # GPU/CPU: Use GQA with n_kv_heads = n_heads // 2 for efficiency
         
-        if HAS_XLA:
-            # TPU: Full MHA for better performance
-            self.n_kv_heads = cfg.n_heads
-        else:
-            # GPU/CPU: GQA with reduced KV heads
-            self.n_kv_heads = cfg.n_heads // 2
+        if HAS_XLA: self.n_kv_heads = cfg.n_heads
+        else: self.n_kv_heads = cfg.n_heads // 2
         
         self.head_dim = cfg.d_model // cfg.n_heads
         assert cfg.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
@@ -327,7 +328,7 @@ class Attention(nn.Module):
 
     def forward(self, x, cache=None):
         """
-        Forward pass with optional KV cache for efficient generation.
+        Forward pass with optional KV cache.
         
         Args:
             x: Input tensor (B, T, d_model)

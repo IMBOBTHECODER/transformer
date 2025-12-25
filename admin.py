@@ -1,5 +1,18 @@
 # admin.py
 import os
+import sys
+
+# Fix pyarrow/datasets compatibility on first run
+try:
+    import pyarrow as pa
+    if not hasattr(pa, 'PyExtensionType'):
+        print("Installing compatible versions of pyarrow and datasets...")
+        os.system(f"{sys.executable} -m pip install -q --upgrade 'pyarrow>=14.0.0' 'datasets>=2.14.0' --force-reinstall")
+        print("Restarting Python... Please re-run the script.")
+        sys.exit(0)
+except Exception:
+    pass
+
 # Disable tokenizers parallelism to avoid fork warnings with DataLoader workers
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -87,7 +100,7 @@ if HAS_XLA:
     cfg.gradient_checkpointing = False  # XLA handles memory; checkpointing adds useless recomputation
     cfg.use_flash_attention = False  # TPU: SDPA is unfused, no FlashAttention support (~3-6x slower than GPU FA)
     cfg.sam = False  # SAM overhead not worth it on TPU
-    print("Using TPU (XLA backend)")
+    print("Using TPU (XLA backend)...")
 elif torch.cuda.is_available():
     device = "cuda"
     # Detect GPU and set dtype accordingly
@@ -103,12 +116,12 @@ elif torch.cuda.is_available():
         # Newer GPUs (A100, H100, RTX3090+): support bfloat16
         cfg.dtype = torch.bfloat16
         print(f"Detected {gpu_name.upper()}: Using bfloat16")
-    print("Using CUDA GPU")
+    print("Using GPU (CUDA backend)...")
 else:
     device = "cpu"
     cfg.dtype = torch.float32  # FP32 for CPU stability
     cfg.compile = False  # Disable compile on CPU
-    print("Using CPU")
+    print("Using CPU...")
     
 # Backend optimizations (GPU only)
 if torch.cuda.is_available() and not HAS_XLA:
