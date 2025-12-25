@@ -12,13 +12,9 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 
-# Try to import XLA for TPU support
-try:
-    import torch_xla.core.xla_model as xm
-    from torch_xla.distributed.parallel_loader import MpDeviceLoader
-    HAS_XLA = True
-except ImportError:
-    HAS_XLA = False
+if HAS_XLA:
+    MpDeviceLoader = MpDeviceLoader  # For type hinting
+else:
     MpDeviceLoader = None
 
 # =========================================================

@@ -6,6 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 
+# Try to import XLA for TPU support
+try:
+    import torch_xla.core.xla_model as xm
+    from torch_xla.distributed.parallel_loader import MpDeviceLoader
+    HAS_XLA = True
+except ImportError:
+    HAS_XLA = False
 
 def compile_model(model, mode='reduce-overhead'):
     """
