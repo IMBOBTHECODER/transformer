@@ -1,6 +1,5 @@
 # core.py
 import torch
-from admin import HAS_XLA
 from utils import activation_fn
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +8,6 @@ from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors
 # Try to import XLA for TPU support
 try:
     import torch_xla.core.xla_model as xm
-    from torch_xla.distributed.parallel_loader import MpDeviceLoader
     HAS_XLA = True
 except ImportError:
     HAS_XLA = False

@@ -13,7 +13,7 @@ from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 
 if HAS_XLA:
-    MpDeviceLoader = MpDeviceLoader  # For type hinting
+    from torch_xla.distributed.parallel_loader import MpDeviceLoader
 else:
     MpDeviceLoader = None
 
