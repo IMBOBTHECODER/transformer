@@ -267,7 +267,7 @@ if __name__ == "__main__":
     else:
         print(f"Training tokenizer '{tokenizer_id}'...")
         # Stream tokenization during training to avoid materializing all text
-        def stream_text_for_training(dataset, chunk_size=10000):
+        def stream_text_for_training(dataset, chunk_size=16384):
             buffer = []
             for sample in dataset:
                 buffer.append(sample["text"])
@@ -290,7 +290,7 @@ if __name__ == "__main__":
     print(f"Actual vocabulary size: {tokenizer.get_vocab_size()}")
 
     # Stream tokenization: avoid materializing all texts in memory
-    def stream_tokenize(dataset, tokenizer, chunk_size=4096):
+    def stream_tokenize(dataset, tokenizer, chunk_size=16384):
         """Stream tokenization to avoid loading entire dataset in memory."""
         buffer = []
         for sample in dataset:
