@@ -51,7 +51,7 @@ class GPTConfig:
     lr: float = 3e-4
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
-    batch_size: int = 256
+    batch_size: int = 128
     sequence_length: int = 512
     
     # advanced optimizations
@@ -90,11 +90,24 @@ if HAS_XLA:
     print("Using TPU (XLA backend)")
 elif torch.cuda.is_available():
     device = "cuda"
-    cfg.dtype = torch.bfloat16  # BF16 for Ampere+
+    # Detect GPU and set dtype accordingly
+    gpu_name = torch.cuda.get_device_name(0).lower()
+    if "t4" in gpu_name or "k80" in gpu_name or "p100" in gpu_name:
+        # Older GPUs: no native bfloat16 support
+        cfg.dtype = torch.float32
+        cfg.compile = False  # Disable compile on older GPUs
+        cfg.gradient_checkpointing = True  # Keep gradient checkpointing for memory
+        cfg.batch_size = min(cfg.batch_size, 64)  # Reduce batch size for smaller memory
+        print(f"Detected {gpu_name.upper()}: Using float32, batch_size={cfg.batch_size}, gradckpt=True, compile=False")
+    else:
+        # Newer GPUs (A100, H100, RTX3090+): support bfloat16
+        cfg.dtype = torch.bfloat16
+        print(f"Detected {gpu_name.upper()}: Using bfloat16")
     print("Using CUDA GPU")
 else:
     device = "cpu"
     cfg.dtype = torch.float32  # FP32 for CPU stability
+    cfg.compile = False  # Disable compile on CPU
     print("Using CPU")
     
 # Backend optimizations (GPU only)
