@@ -386,7 +386,11 @@ class Attention(nn.Module):
             dropout_p=self.proj_drop.p if self.training else 0.0
         )
         out = out.transpose(1, 2).reshape(B, T, C)
-        return self.proj_drop(self.out_proj(out)), (k_cache, v_cache, new_pos) if cache is not None else None
+        
+        if cache is not None:
+            return self.proj_drop(self.out_proj(out)), (k_cache, v_cache, new_pos)
+        else:
+            return self.proj_drop(self.out_proj(out)), None
 
 # =========================================================
 # FUSED MLP (gate+value projected together, fused by torch.compile)
