@@ -378,10 +378,15 @@ class Attention(nn.Module):
         k = k.transpose(1, 2)  # (B, T, H_kv, D) -> (B, H_kv, T, D)
         v = v.transpose(1, 2)  # (B, T, H_kv, D) -> (B, H_kv, T, D)
 
-        # Use PyTorch SDPA with built-in GQA broadcasting
-        # SDPA automatically broadcasts (B, H_kv, T, D) KV to match (B, H, T, D) Q
+        # GQA: Expand K, V to match Q's head count (SDPA doesn't auto-broadcast)
+        if self.n_kv_heads < self.n_heads:
+            rep = self.n_heads // self.n_kv_heads
+            k = k.repeat_interleave(rep, dim=1)  # (B, H_kv, T, D) -> (B, H, T, D)
+            v = v.repeat_interleave(rep, dim=1)  # (B, H_kv, T, D) -> (B, H, T, D)
+        
+        # Use PyTorch SDPA
         out = F.scaled_dot_product_attention(
-            q, k, v,  # k,v stay as (B, H_kv, T, D), q is (B, H, T, D)
+            q, k, v,  # All now (B, H, T, D)
             is_causal=True,
             dropout_p=self.proj_drop.p if self.training else 0.0
         )

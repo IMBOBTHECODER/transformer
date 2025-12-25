@@ -1,7 +1,10 @@
 # admin.py
+import os
+# Disable tokenizers parallelism to avoid fork warnings with DataLoader workers
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 from core import *
 import gc
-import os
 import time
 import torch
 import math
@@ -300,15 +303,13 @@ if __name__ == "__main__":
     
     # Tokenize in streaming fashion (chunks never materialize full dataset)
     print("Tokenizing dataset (streaming)...")
-    text_tokens_list = []
+    chunks = []
     for chunk_tokens in stream_tokenize(ds, tokenizer):
-        text_tokens_list.extend(chunk_tokens)
+        chunks.append(np.asarray(chunk_tokens, dtype=np.uint16))
     
-    # Convert to NumPy uint16 for memory efficiency
-    # Python list: ~28 bytes/element → NumPy uint16: ~2 bytes/element (14x savings)
-    # 10M tokens: 280MB → 20MB RAM
-    text_tokens = np.array(text_tokens_list, dtype=np.uint16)
-    del text_tokens_list
+    # Vectorized concatenation (3-6x faster than list.extend)
+    text_tokens = np.concatenate(chunks) if chunks else np.array([], dtype=np.uint16)
+    del chunks
     
     total_tokens = len(text_tokens)
     print(f"Total tokens: {total_tokens}")
@@ -435,38 +436,25 @@ if __name__ == "__main__":
         if cfg.sam:
             optimizer.first_step()
             
-            # Recompute loss at perturbed weights (single batch for efficiency)
-            try:
-                x_batch_sam, y_batch_sam = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                x_batch_sam, y_batch_sam = next(train_iter)
-            
-            # Move to device (MpDeviceLoader already on device for TPU)
-            if not HAS_XLA:
-                x_batch_sam = x_batch_sam.to(device, dtype=torch.long)
-                y_batch_sam = y_batch_sam.to(device, dtype=torch.long)
-            else:
-                x_batch_sam = x_batch_sam.to(dtype=torch.long)
-                y_batch_sam = y_batch_sam.to(dtype=torch.long)
-            
+            # Recompute loss at perturbed weights using same batch (avoid consuming extra batch)
             if HAS_XLA:
-                logits, _ = model(x_batch_sam)
+                logits, _ = model(x_batch)
                 loss_perturbed = F.cross_entropy(
                     logits.flatten(0, 1),
-                    y_batch_sam.flatten(),
+                    y_batch.flatten(),
                     label_smoothing=cfg.label_smoothing
                 )
             else:
                 with torch.autocast(device_type=device, dtype=cfg.dtype if device == 'cuda' else torch.float32):
-                    logits, _ = model(x_batch_sam)
+                    logits, _ = model(x_batch)
                     loss_perturbed = F.cross_entropy(
                         logits.flatten(0, 1),
-                        y_batch_sam.flatten(),
+                        y_batch.flatten(),
                         label_smoothing=cfg.label_smoothing
                     )
             loss_perturbed.backward()
             optimizer.second_step()
+            optimizer.zero_grad()
         else:
             base_opt.step()
             base_opt.zero_grad()
