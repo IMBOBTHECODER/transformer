@@ -77,9 +77,10 @@ class GPTConfig:
     # =========================================================
     # DATASET CONFIGURATION
     # =========================================================
-    dataset_name: str = "Salesforce/wikitext"
+    dataset_name: str = "roneneldan/TinyStories"
+    dataset_config: str = None  # Set to None for datasets without config, or config name (e.g., "wikitext-103-raw-v1")
     num_samples: int = 350_000
-    dataset_split: str = "wikitext-103-raw-v1"  # Can be "train[:250000]" for subset
+    dataset_split: str = "train"  # Dataset split (train/validation/test)
 
 
 def apply_tpu_constraints(cfg: GPTConfig) -> GPTConfig:

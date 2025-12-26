@@ -65,7 +65,10 @@ def prepare_tokenizer_and_dataset(vocab_size, tokenizer_id, num_samples=250000):
 
     # Load dataset
     print(f"Loading {cfg.dataset_name} dataset ({cfg.num_samples:,} samples)...")
-    ds = load_dataset(cfg.dataset_name, split=f"{cfg.dataset_split}[:{cfg.num_samples}]")
+    if cfg.dataset_config:
+        ds = load_dataset(cfg.dataset_name, cfg.dataset_config, split=f"{cfg.dataset_split}[:{cfg.num_samples}]")
+    else:
+        ds = load_dataset(cfg.dataset_name, split=f"{cfg.dataset_split}[:{cfg.num_samples}]")
     print(f"✓ Dataset loaded: {len(ds):,} samples")
 
     # Stream text in chunks
