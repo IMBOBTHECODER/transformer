@@ -5,7 +5,6 @@ import time
 import math
 import torch
 import numpy as np
-from dataclasses import dataclass
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
@@ -17,99 +16,28 @@ from utils import build_optimizer
 import gc
 from datasets import load_dataset
 
+# Import unified config
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from config import GPTConfig, apply_gpu_device_tuning
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
-@dataclass
-class GPTConfig:
-    # Model architecture
-    vocab_size: int = 18_000
-    d_model: int = 384
-    n_heads: int = 8
-    n_layers: int = 8
-    mlp_ratio: int = 4
-    yarn_scale: float = 1.0
-
-    # GPU settings
-    dtype: torch.dtype = torch.float32
-    compile: bool = True
-    compile_mode: str = "reduce-overhead"
-    use_rope: bool = True
-    gradient_checkpointing: bool = True
-    use_flash_attention: bool = True
-
-    # Activation and optimization
-    activation: str = "swiglu"
-    optimizer: str = "adamw"
-    lr: float = 3e-4
-    weight_decay: float = 0.1
-    betas: tuple = (0.9, 0.95)
-    batch_size: int = 128
-    sequence_length: int = 512
-
-    # Regularization
-    dropout: float = 0.1
-    label_smoothing: float = 0.1
-    gradient_accumulation_steps: int = 1
-    gradient_clipping: bool = True
-    max_grad_norm: float = 1.0
-
-    # SAM optimizer
-    sam: bool = False
-    sam_rho: float = 0.08
-
-    # Training schedule
-    init_std: float = 0.02
-    id: str = "tinystories"
-    total_steps: int = 5_000
-    val_interval: int = 200
-    use_ema: bool = True
-    ema_decay: float = 0.99
-    ema_update_interval: float = 0.02
-    val_split: float = 0.05
-
-
 cfg = GPTConfig()
-
+cfg = apply_gpu_device_tuning(cfg)
 
 # =========================================================
 # DEVICE SETUP
 # =========================================================
-def setup_device():
-    """Configure device and optimize settings."""
-    if torch.cuda.is_available():
-        device = "cuda"
-        gpu_name = torch.cuda.get_device_name(0).lower()
+if torch.cuda.is_available():
+    device = "cuda"
+    gpu_name = torch.cuda.get_device_name(0).lower()
+    print(f"✓ GPU: {gpu_name.upper()} | {cfg.dtype} | Compile: {cfg.compile}")
+else:
+    device = "cpu"
+    print("✓ CPU mode")
 
-        # Modern GPUs (A100, H100, RTX3090+): use BF16 and optimizations
-        if "a100" in gpu_name or "h100" in gpu_name or "rtx" in gpu_name:
-            cfg.dtype = torch.bfloat16
-            cfg.use_flash_attention = True
-            print(f"✓ GPU: {gpu_name.upper()} | BF16 | Flash Attention")
-        else:
-            # Older GPUs (T4, K80, P100): limited to FP32
-            cfg.dtype = torch.float32
-            cfg.compile = False
-            cfg.gradient_checkpointing = True
-            cfg.batch_size = min(cfg.batch_size, 64)
-            print(f"✓ GPU: {gpu_name.upper()} | FP32 | batch={cfg.batch_size}")
-
-        # GPU matrix operation optimizations
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    else:
-        device = "cpu"
-        cfg.dtype = torch.float32
-        cfg.compile = False
-        print("✓ CPU mode")
-
-    return device
-
-
-device = setup_device()
 print(f"Device: {device}\n")
 
 

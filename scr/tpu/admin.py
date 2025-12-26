@@ -5,7 +5,6 @@ import time
 import math
 import torch
 import numpy as np
-from dataclasses import dataclass
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
@@ -22,60 +21,16 @@ from utils import build_optimizer
 import gc
 from datasets import load_dataset
 
+# Import unified config
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from config import GPTConfig, apply_tpu_constraints
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
-@dataclass
-class GPTConfig:
-    # Model architecture
-    vocab_size: int = 18_000
-    d_model: int = 384
-    n_heads: int = 8
-    n_layers: int = 8
-    mlp_ratio: int = 4
-    yarn_scale: float = 1.0
-
-    # TPU settings
-    dtype: torch.dtype = torch.bfloat16
-    compile: bool = False  # XLA handles compilation
-    compile_mode: str = "reduce-overhead"
-    use_rope: bool = True
-    gradient_checkpointing: bool = False  # XLA handles memory
-    use_flash_attention: bool = False  # SDPA unfused on TPU
-
-    # Activation and optimization
-    activation: str = "swiglu"
-    optimizer: str = "adamw"
-    lr: float = 3e-4
-    weight_decay: float = 0.1
-    betas: tuple = (0.9, 0.95)
-    batch_size: int = 128
-    sequence_length: int = 512
-
-    # Regularization
-    dropout: float = 0.0  # TPU: disabled (interferes with XLA fusion)
-    label_smoothing: float = 0.1
-    gradient_accumulation_steps: int = 1
-    gradient_clipping: bool = False  # TPU: disabled (unnecessary with BF16)
-    max_grad_norm: float = 1.0
-
-    # SAM optimizer
-    sam: bool = False
-    sam_rho: float = 0.08
-
-    # Training schedule
-    init_std: float = 0.02
-    id: str = "tinystories"
-    total_steps: int = 5_000
-    val_interval: int = 200
-    use_ema: bool = False  # TPU: disabled by default (extra memory transfers)
-    ema_decay: float = 0.99
-    ema_update_interval: float = 0.02
-    val_split: float = 0.05
-
-
 cfg = GPTConfig()
+cfg = apply_tpu_constraints(cfg)  # Apply TPU constraints - these are mandatory
 
 
 # =========================================================
@@ -84,7 +39,7 @@ cfg = GPTConfig()
 def setup_device():
     """Configure TPU device."""
     device = xm.xla_device()
-    print(f"✓ TPU: {device} | BF16 | XLA Compilation")
+    print(f"✓ TPU: {device} | {cfg.dtype} (mandatory on TPU)")
     return device
 
 
