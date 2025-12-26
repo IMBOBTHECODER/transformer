@@ -27,7 +27,7 @@ args = parser.parse_args()
 # =========================================================
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
 
-checkpoint_name = "best_ema_model.pt" if args.checkpoint == "ema" else "best_model.pt"
+checkpoint_name = f"best_ema_model_{cfg.id}.pt" if args.checkpoint == "ema" else f"best_model_{cfg.id}.pt"
 checkpoint_path = f"model/{checkpoint_name}"
 
 if os.path.exists(checkpoint_path):

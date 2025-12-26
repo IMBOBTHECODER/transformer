@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 # TPU imports
+import torch_xla
 import torch_xla.core.xla_model as xm
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
 
@@ -76,7 +77,6 @@ class GPTConfig:
 cfg = GPTConfig()
 # TPU device setup
 device = xm.xla_device()
-print(f"TPU device: {device}")
 
 
 # =========================================================
@@ -102,8 +102,8 @@ def prepare_tokenizer_and_dataset(vocab_size, tokenizer_id, amount=None):
         return tokenizer, text_tokens
     
     # Load dataset
-    print("Loading TinyStories dataset (250k samples)...")
-    ds = load_dataset("roneneldan/TinyStories", split="train[:250000]")
+    print("Loading TinyStories dataset (300k samples)...")
+    ds = load_dataset("roneneldan/TinyStories", split="train[:300000]")
     print(f"✓ Dataset loaded: {len(ds)} samples")
     
     # Stream text in chunks
@@ -199,7 +199,7 @@ def warmup_xla_graph(model, batch_size, seq_len, device):
     with torch.no_grad():
         for i in range(3):
             _ = model(x_sample)
-            xm.mark_step()
+            torch_xla.sync()
             print(f"  Warmup step {i+1}/3")
     print("Warmup complete\n")
 
@@ -406,7 +406,7 @@ class Control:
                 base_opt.zero_grad()
             
             # Mark XLA step (critical for TPU: finalizes the training step)
-            xm.mark_step()
+            torch_xla.sync()
             
             tokens_processed += batch_tokens
             
@@ -450,7 +450,7 @@ class Control:
                         val_batch_count += 1
                 
                 # Mark XLA step after validation (batches all graphs together)
-                xm.mark_step()
+                torch_xla.sync()
                 
                 # Compute average loss (single device sync)
                 if val_losses:
