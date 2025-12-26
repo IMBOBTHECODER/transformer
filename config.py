@@ -74,6 +74,13 @@ class GPTConfig:
     ema_update_interval: float = 0.02
     val_split: float = 0.05
 
+    # =========================================================
+    # DATASET CONFIGURATION
+    # =========================================================
+    dataset_name: str = "Salesforce/wikitext"
+    num_samples: int = 350_000
+    dataset_split: str = "wikitext-103-raw-v1"  # Can be "train[:250000]" for subset
+
 
 def apply_tpu_constraints(cfg: GPTConfig) -> GPTConfig:
     """

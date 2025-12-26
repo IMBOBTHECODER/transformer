@@ -70,8 +70,8 @@ def prepare_tokenizer_and_dataset(vocab_size, tokenizer_id, num_samples=250000):
         return tokenizer, text_tokens
 
     # Load dataset
-    print(f"Loading TinyStories dataset ({num_samples:,} samples)...")
-    ds = load_dataset("roneneldan/TinyStories", split=f"train[:{num_samples}]")
+    print(f"Loading {cfg.dataset_name} dataset ({cfg.num_samples:,} samples)...")
+    ds = load_dataset(cfg.dataset_name, split=f"{cfg.dataset_split}[:{cfg.num_samples}]")
     print(f"✓ Dataset loaded: {len(ds):,} samples")
 
     # Stream text in chunks
