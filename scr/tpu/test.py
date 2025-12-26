@@ -1,14 +1,18 @@
 # test.py (TPU)
+"""TPU-optimized text generation with KV cache."""
 
 import torch
 import os
 import argparse
 import torch.nn.functional as F
-from core import GPT, BPETokenizer
-from admin import cfg, device
 
-# Use max-autotune for inference
-cfg.compile_mode = "max-autotune"
+# TPU imports
+import torch_xla
+import torch_xla.core.xla_model as xm
+
+from core import GPT, BPETokenizer
+from admin import cfg, device, generate
+
 
 # =========================================================
 # ARGUMENT PARSING
@@ -18,7 +22,7 @@ parser.add_argument("prompt", nargs="?", default=None, help="Text prompt")
 parser.add_argument("steps", nargs="?", type=int, default=100, help="Tokens to generate")
 parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
 parser.add_argument("--top_k", type=int, default=30, help="Top-k sampling")
-parser.add_argument("--checkpoint", type=str, default="ema", choices=["ema", "model"], 
+parser.add_argument("--checkpoint", type=str, default="ema", choices=["ema", "model"],
                     help="Checkpoint: 'ema' or 'model'")
 parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 args = parser.parse_args()
@@ -26,48 +30,55 @@ args = parser.parse_args()
 if args.seed is not None:
     torch.manual_seed(args.seed)
 
+
 # =========================================================
 # LOAD MODEL
 # =========================================================
+print("Initializing model...")
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
 model.eval()
-print(f"Model: {cfg.id} | Vocab: {cfg.vocab_size} | Device: {device}")
+print(f"Model: {cfg.id} | Vocab: {cfg.vocab_size:,} | Device: {device}")
 
 checkpoint_name = f"best_ema_model_{cfg.id}.pt" if args.checkpoint == "ema" else f"best_model_{cfg.id}.pt"
 checkpoint_path = f"model/{checkpoint_name}"
 
 if os.path.exists(checkpoint_path):
+    # Load to CPU first for XLA compatibility
+    state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+
+    # Remove torch.compile wrapper prefix if present
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
     try:
-        # Load to CPU first for XLA compatibility
-        state_dict = torch.load(checkpoint_path, map_location='cpu')
-        
-        # Remove torch.compile wrapper prefix if present
-        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
-            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-        
         model.load_state_dict(state_dict)
         print(f"✓ Loaded {args.checkpoint.upper()} checkpoint")
     except RuntimeError as e:
         print(f"✗ Checkpoint mismatch: {e}")
         print("  Using randomly initialized model")
 else:
-    print(f"✗ No checkpoint at {checkpoint_path}")
+    print(f"⚠ No checkpoint at {checkpoint_path}")
     print("  Using randomly initialized model")
 
+
 # =========================================================
-# TOKENIZER
+# LOAD TOKENIZER
 # =========================================================
-tokenizer = BPETokenizer(cfg.vocab_size)
+print("Loading tokenizer...")
+tokenizer = BPETokenizer(cfg.vocab_size, tokenizer_id=cfg.id)
 tokenizer_path = f"tokenizer/tokenizer_{cfg.id}.json"
 
 if os.path.exists(tokenizer_path):
-    print(f"✓ Tokenizer loaded")
     tokenizer.load(tokenizer_path)
+    print(f"✓ Tokenizer loaded")
 else:
-    raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}. Run: python -c \"from admin import Control; c = Control(); c.tokenize()\"")
+    print(f"✗ Tokenizer not found at {tokenizer_path}")
+    print("  Run: python admin.py to prepare tokenizer first")
+    exit(1)
+
 
 # =========================================================
-# GENERATION
+# PREPARE GENERATION
 # =========================================================
 if args.prompt is None:
     print("\nUsage: python test.py \"prompt\" [steps] [--checkpoint {ema,model}] [--seed SEED]")
@@ -96,44 +107,21 @@ if args.seed is not None:
     print(f"Seed: {args.seed}")
 print("-" * 60)
 
+
+# =========================================================
+# GENERATE TEXT
+# =========================================================
 with torch.no_grad():
     prompt_tokens = tokenizer.encode(prompt)
     prompt_tensor = torch.tensor([prompt_tokens], device=device, dtype=torch.long)
-    
-    # Preallocate KV cache for efficient generation
-    max_seq_len = len(prompt_tokens) + steps
-    cache = model.allocate_kv_cache(
-        batch_size=1,
-        max_seq_len=max_seq_len,
-        device=device,
-        dtype=cfg.dtype
-    )
-    
-    # Prefill phase: process entire prompt (variable T) in single compiled graph
-    _, cache = model.forward_prefill(prompt_tensor, cache)
-    
-    # Decode phase: single-token generation (T=1, static shape for XLA)
-    generated = prompt_tensor
-    for _ in range(steps):
-        # Single-token forward pass (T=1, static shape for XLA)
-        logits, cache = model.forward_generate(generated[:, -1:], cache, step=_)
-        logits = logits[:, -1:] / temperature
-        
-        # Top-k sampling
-        if top_k > 0 and top_k < logits.shape[-1]:
-            top_k_vals, _ = torch.topk(logits, top_k, dim=-1)
-            min_top_k = top_k_vals[..., -1:]
-            logits = torch.where(logits < min_top_k, torch.tensor(float('-inf'), device=device), logits)
-        
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs.squeeze(-1), 1).unsqueeze(1)
-        
-        # Early stopping on end-of-text token (if vocab supports it)
-        if hasattr(tokenizer, 'eos_token_id') and next_token.item() == tokenizer.eos_token_id:
-            break
-        
-        generated = torch.cat([generated, next_token], dim=1)
-    
+
+    # Generate with KV cache
+    generated = generate(model, prompt_tensor, steps=steps, temperature=temperature,
+                         top_k=top_k, use_cache=True)
+
+    # Sync for TPU
+    torch_xla.sync()
+
     output_text = tokenizer.decode(generated[0].tolist())
     print("\nGenerated text:")
     print("=" * 60)
