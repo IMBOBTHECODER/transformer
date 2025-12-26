@@ -1,4 +1,8 @@
-# core.py (TPU)
+# core.py (GPU)
+"""
+GPU-optimized transformer model with flash attention, GQA, and mixed precision support.
+Uses torch.compile for automatic kernel fusion and optimization.
+"""
 
 import torch
 from utils import activation_fn
@@ -8,34 +12,33 @@ from tokenizers import Tokenizer, models, trainers, pre_tokenizers
 from tokenizers.processors import ByteLevel as ByteLevelProcessor
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 
-# TPU import (required)
-import torch_xla.core.xla_model as xm
 
-
-def compile_model(model: nn.Module, mode: str = 'reduce-overhead') -> nn.Module:
-    """No-op on TPU (XLA compilation is automatic)."""
-    return model
+def compile_model(model, mode='reduce-overhead'):
+    """Compile model with torch.compile for kernel fusion and faster inference."""
+    return torch.compile(model, mode=mode)
 
 # =========================================================
 # TOKENIZER
 # =========================================================
-
 class BPETokenizer:
-    """BPE tokenizer (Rust-based HuggingFace) with special tokens and compression tracking."""
+    """BPE tokenizer using HuggingFace tokenizers (Rust-based, production-grade)."""
     
-    def __init__(self, vocab_size: int, min_frequency: int = 2, tokenizer_id: str = "default"):
+    def __init__(self, vocab_size, min_frequency=2, tokenizer_id="default"):
+        self.tokenizer_id = tokenizer_id
         self.vocab_size = vocab_size
         self.min_frequency = min_frequency
-        self.tokenizer_id = tokenizer_id
+        
+        # Special token IDs (resolved after training)
         self.pad_id = self.unk_id = self.bos_id = self.eos_id = None
         
+        # HuggingFace tokenizer with byte-level encoding
         self.tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
         self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         self.tokenizer.post_processor = ByteLevelProcessor(trim_offsets=True)
         self.tokenizer.decoder = ByteLevelDecoder()
 
     def train(self, text, show_stats=True):
-        """Train tokenizer on text and cache special token IDs."""
+        """Train BPE tokenizer on text."""
         trainer = trainers.BpeTrainer(
             vocab_size=self.vocab_size,
             min_frequency=min(self.min_frequency, 5),
@@ -45,8 +48,8 @@ class BPETokenizer:
             initial_alphabet=[chr(i) for i in range(256)],
         )
         
-        # Train on chunks for better memory usage and merge quality
-        chunk_size = 16_777_216
+        # Split into chunks for efficient training
+        chunk_size = 16_777_216  # 16MB chunks
         chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
         self.tokenizer.train_from_iterator(chunks, trainer=trainer)
         
@@ -60,7 +63,7 @@ class BPETokenizer:
             self._print_vocab_stats()
 
     def encode(self, text, add_special_tokens=False):
-        """Encode text to token IDs, optionally adding BOS/EOS."""
+        """Encode text to token IDs."""
         ids = self.tokenizer.encode(text, add_special_tokens=False).ids
         
         if add_special_tokens:
@@ -68,7 +71,6 @@ class BPETokenizer:
                 ids = [self.bos_id] + ids
             if self.eos_id is not None:
                 ids = ids + [self.eos_id]
-        
         return ids
 
     def encode_batch(self, texts, add_special_tokens=False):
@@ -88,21 +90,18 @@ class BPETokenizer:
         return [enc.ids for enc in encodings]
 
     def decode(self, ids, skip_special_tokens=True):
-        """Decode token IDs to text, optionally filtering special tokens."""
+        """Decode token IDs back to text."""
         if skip_special_tokens:
             special_ids = {self.pad_id, self.unk_id, self.bos_id, self.eos_id}
             special_ids.discard(None)
             ids = [id_ for id_ in ids if id_ not in special_ids]
-        
-        # Use HuggingFace decoder for proper ByteLevel decoding
-        text = self.tokenizer.decode(ids)
-        return text
+        return self.tokenizer.decode(ids)
 
     def decode_batch(self, batch_ids, skip_special_tokens=True):
         """Decode multiple sequences efficiently."""
         if skip_special_tokens:
             special_ids = {self.pad_id, self.unk_id, self.bos_id, self.eos_id}
-            special_ids.discard(None)  # Remove None if any IDs weren't resolved
+            special_ids.discard(None)
             batch_ids = [
                 [id_ for id_ in ids if id_ not in special_ids]
                 for ids in batch_ids
@@ -114,7 +113,7 @@ class BPETokenizer:
         return len(self.tokenizer.get_vocab())
 
     def get_compression_ratio(self, text):
-        """Return bytes-per-token ratio (higher = better compression)."""
+        """Calculate compression ratio (original_chars / tokens). Higher is better."""
         num_tokens = len(self.encode(text))
         return len(text) / max(num_tokens, 1)
 
@@ -124,7 +123,7 @@ class BPETokenizer:
         print(f"Saved tokenizer '{self.tokenizer_id}' to {filepath}")
 
     def load(self, filepath):
-        """Load tokenizer from disk and cache special token IDs."""
+        """Load tokenizer from disk and resolve special token IDs."""
         self.tokenizer = Tokenizer.from_file(filepath)
         self.pad_id = self.tokenizer.token_to_id("<pad>")
         self.unk_id = self.tokenizer.token_to_id("<unk>")
@@ -134,16 +133,71 @@ class BPETokenizer:
 
     def _print_vocab_stats(self):
         """Print vocabulary statistics."""
-        actual_size = len(self.tokenizer.get_vocab())
-        print(f"\nTokenizer [{self.tokenizer_id}]: {actual_size} / {self.vocab_size} tokens")
-        print(f"  Special: pad={self.pad_id}, unk={self.unk_id}, bos={self.bos_id}, eos={self.eos_id}")
+        vocab = self.tokenizer.get_vocab()
+        print(f"\nTokenizer Statistics [{self.tokenizer_id}]:")
+        print(f"  Vocabulary size: {len(vocab)} / {self.vocab_size}")
+        print(f"  Special tokens: pad={self.pad_id}, unk={self.unk_id}, bos={self.bos_id}, eos={self.eos_id}")
 
 
 # =========================================================
-# RMSNorm (RMS Layer Normalization)
+# RoPE (Rotary Position Embeddings)
+# =========================================================
+class RoPE(nn.Module):
+    """Rotary position embeddings with YaRN scaling for extended context."""
+    
+    def __init__(self, head_dim, max_seq_len=2048, yarn_scale=1.0):
+        super().__init__()
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        # YaRN: compress positions for extended context during generation
+        self.yarn_scale = yarn_scale
+        rope_max_len = max(max_seq_len, int(max_seq_len * yarn_scale))
+        
+        # Precompute sin/cos for all positions (avoid per-token computation)
+        freqs = torch.outer(torch.arange(rope_max_len, dtype=torch.float32), inv_freq)
+        self.register_buffer("sin", freqs.sin(), persistent=False)
+        self.register_buffer("cos", freqs.cos(), persistent=False)
+        self.rope_max_len = rope_max_len
+
+    def forward(self, x, start_pos=0, inference=False):
+        """Apply RoPE with optional YaRN scaling for extended context."""
+        T = x.size(1)
+        
+        if inference and self.yarn_scale > 1.0:
+            # Scale positions down for extended context during generation
+            scaled_pos = torch.arange(start_pos, start_pos + T, dtype=torch.float32, device=x.device) / self.yarn_scale
+            scaled_pos = torch.clamp(scaled_pos, 0, self.rope_max_len - 1)
+            indices = scaled_pos.long()
+            sin_cache = self.sin[indices]
+            cos_cache = self.cos[indices]
+        else:
+            # Use precomputed cache (faster for training)
+            sin_cache = self.sin[start_pos:start_pos+T]
+            cos_cache = self.cos[start_pos:start_pos+T]
+        
+        sin = sin_cache.unsqueeze(0).unsqueeze(2).to(x.dtype)
+        cos = cos_cache.unsqueeze(0).unsqueeze(2).to(x.dtype)
+        
+        # Vectorized rotation without temporary tensors
+        # Extract even and odd indices
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        
+        # Stack rotated components and flatten to interleave them
+        rotated = torch.stack(
+            (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos),
+            dim=-1
+        ).flatten(-2)
+        return rotated
+
+
+# =========================================================
+# RMSNorm (Root Mean Square Layer Normalization)
 # =========================================================
 class RMSNorm(nn.Module):
-    """RMS Layer Normalization (PyTorch ≥2.1)."""
+    """RMS normalization using PyTorch's built-in (v2.1+). Simpler than LayerNorm."""
+    
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
@@ -151,149 +205,98 @@ class RMSNorm(nn.Module):
     
     def forward(self, x):
         return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
-
-
 # =========================================================
-# RoPE
-# =========================================================
-class RoPE(nn.Module):
-    def __init__(self, head_dim, max_seq_len=2048, yarn_scale=1.0):
-        super().__init__()
-        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        
-        self.yarn_scale = yarn_scale
-        
-        # Precompute sin/cos caches for all positions
-        rope_max_len = max(max_seq_len, int(max_seq_len * yarn_scale))
-        freqs = torch.outer(torch.arange(rope_max_len, dtype=torch.float32), inv_freq)
-        self.register_buffer("sin", freqs.sin(), persistent=False)
-        self.register_buffer("cos", freqs.cos(), persistent=False)
-        self.rope_max_len = rope_max_len
-        
-        # Precompute position indices to avoid torch.arange() in forward pass
-        pos_arange = torch.arange(rope_max_len, dtype=torch.float32)
-        scaled_indices = torch.clamp(pos_arange / yarn_scale, 0, rope_max_len - 1).long()
-        self.register_buffer("scaled_indices", scaled_indices, persistent=False)
-        self.register_buffer("unscaled_indices", torch.arange(rope_max_len, dtype=torch.long), persistent=False)
-
-    def _apply_rope(self, x, indices):
-        """Core RoPE: rotate using precomputed sin/cos and position indices."""
-        sin = self.sin[indices].unsqueeze(0).unsqueeze(2).to(x.dtype)
-        cos = self.cos[indices].unsqueeze(0).unsqueeze(2).to(x.dtype)
-        
-        # Interleave and rotate (stack+flatten avoids torch.empty_like overhead)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        rotated = torch.stack(
-            (x1 * cos - x2 * sin, x1 * sin + x2 * cos),
-            dim=-1
-        ).flatten(-2)
-        return rotated
-
-    def forward_train(self, x, start_pos=0):
-        """Training RoPE (no YaRN scaling). XLA compiles as separate unbranched graph."""
-        T = x.size(1)
-        indices = self.unscaled_indices[start_pos:start_pos + T]
-        return self._apply_rope(x, indices)
-
-    def forward_infer(self, x, start_pos=0):
-        """Inference RoPE (YaRN scaling). XLA compiles as separate unbranched graph."""
-        T = x.size(1)
-        indices = self.scaled_indices[start_pos:start_pos + T]
-        return self._apply_rope(x, indices)
-
-    def forward(self, x, start_pos=0, inference=False):
-        """Python-time dispatch to training or inference RoPE path (zero HLO branching)."""
-        if inference:
-            return self.forward_infer(x, start_pos)
-        else:
-            return self.forward_train(x, start_pos)
-
-
-# =========================================================
-# ATTENTION (Full MHA for TPU)
+# ATTENTION (Flash Attention + Grouped Query Attention)
 # =========================================================
 class Attention(nn.Module):
-    """Full Multi-Head Attention (no KV reduction) with fused RMSNorm+QKV projection."""
+    """Multi-head attention with GQA and fused QKV projections for efficiency."""
+    
     def __init__(self, cfg):
         super().__init__()
         self.n_heads = cfg.n_heads
-        self.n_kv_heads = cfg.n_heads  # No KV reduction on TPU
+        self.n_kv_heads = cfg.n_heads // 2  # GQA: 4 KV heads vs 8 Q heads
         self.head_dim = cfg.d_model // cfg.n_heads
-        assert cfg.n_heads % self.n_kv_heads == 0
+        self.n_rep = cfg.n_heads // self.n_kv_heads
         
-        self.ln = RMSNorm(cfg.d_model)
-        self.qkv_proj = nn.Linear(cfg.d_model, 3 * cfg.n_heads * self.head_dim, bias=True)
+        # Fused QKV projection: single GEMM instead of two
+        # Output shape: (n_heads + 2*n_kv_heads) * head_dim
+        qkv_dim = (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
+        self.qkv = nn.Linear(cfg.d_model, qkv_dim, bias=True)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
+        
+        self.attn_drop = nn.Dropout(cfg.dropout)
         self.proj_drop = nn.Dropout(cfg.dropout)
         
+        # RoPE for position embeddings
         yarn_scale = getattr(cfg, 'yarn_scale', 1.0)
         self.rope = RoPE(self.head_dim, max_seq_len=cfg.sequence_length, yarn_scale=yarn_scale)
 
     def forward(self, x, cache=None):
-        """Attention forward with optional KV cache."""
+        """Forward pass with optional KV cache for generation."""
         B, T, C = x.shape
         pos = cache[2] if cache is not None else 0
         inference = cache is not None
 
-        # Fuse RMSNorm + QKV projection (single HLO operation)
-        x_norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.ln.eps) * self.ln.weight
-        qkv = F.linear(x_norm, self.qkv_proj.weight, self.qkv_proj.bias)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim)
-        k = k.view(B, T, self.n_heads, self.head_dim)
-        v = v.view(B, T, self.n_heads, self.head_dim)
+        # Fused QKV projection
+        qkv = self.qkv(x)
         
-        # Specialized RoPE paths (no branching in compiled graph)
-        if inference:
-            q = self.rope.forward_infer(q, start_pos=pos)
-            k = self.rope.forward_infer(k, start_pos=pos)
-        else:
-            q = self.rope.forward_train(q, start_pos=pos)
-            k = self.rope.forward_train(k, start_pos=pos)
+        # Slice into Q, K, V
+        # Q: first n_heads*head_dim values
+        # K, V: next 2*n_kv_heads*head_dim values
+        q = qkv[..., :self.n_heads * self.head_dim].view(B, T, self.n_heads, self.head_dim)
+        kv = qkv[..., self.n_heads * self.head_dim:].view(B, T, 2 * self.n_kv_heads, self.head_dim)
+        k, v = kv[..., :self.n_kv_heads, :], kv[..., self.n_kv_heads:, :]
         
-        # Handle cache
+        # Apply RoPE before transpose
+        q = self.rope(q, start_pos=pos, inference=inference)
+        k = self.rope(k, start_pos=pos, inference=inference)
+        
+        # Handle KV cache
         if cache is not None:
             k_cache, v_cache, _ = cache
             max_pos = k_cache.shape[1]
             assert pos + T <= max_pos, f"KV cache overflow: pos={pos}, T={T}, max={max_pos}"
-            
-            from torch_xla.core.functions import dynamic_update_slice
-            k_cache = dynamic_update_slice(k_cache, k, (0, pos, 0, 0))
-            v_cache = dynamic_update_slice(v_cache, v, (0, pos, 0, 0))
-            
+            k_cache[:, pos:pos+T, :, :] = k
+            v_cache[:, pos:pos+T, :, :] = v
             k, v = k_cache, v_cache
             new_pos = pos + T
         else:
             new_pos = None
         
-        # Transpose to (B, H, T, D) for SDPA
+        # Transpose to (B, H, T, D) for flash attention
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+
+        # Expand KV for GQA (repeat KV heads to match Q)
+        if self.n_kv_heads < self.n_heads:
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
         
-        # SDPA (no GQA repetition needed with full MHA)
+        # Flash attention with GQA support
         out = F.scaled_dot_product_attention(
             q, k, v,
             is_causal=True,
-            dropout_p=self.proj_drop.p if self.training else 0.0
+            dropout_p=self.proj_drop.p if self.training else 0.0,
+            enable_gqa=True
         )
+        
+        # Reshape and project
         out = out.transpose(1, 2).reshape(B, T, C)
+        out = self.proj_drop(self.out_proj(out))
         
         if cache is not None:
-            return self.proj_drop(self.out_proj(out)), (k_cache, v_cache, new_pos)
-        else:
-            return self.proj_drop(self.out_proj(out)), None
+            return out, (k_cache, v_cache, new_pos)
+        return out, None
 
 # =========================================================
-# FUSED MLP (gate+value projected together, fused by torch.compile)
+# Fused MLP (Feed-Forward Network)
 # =========================================================
 class FusedMLP(nn.Module):
-    """SwiGLU MLP with fused RMSNorm+FC projection."""
+    """Fused MLP: Linear(2x) → chunk → activation → multiply → Linear. torch.compile optimizes this."""
+    
     def __init__(self, d_model, hidden_dim, activation="swiglu"):
         super().__init__()
-        self.ln = RMSNorm(d_model)
         self.fc = nn.Linear(d_model, 2 * hidden_dim, bias=True)
         self.proj = nn.Linear(hidden_dim, d_model, bias=True)
         self.activation = activation
@@ -304,10 +307,8 @@ class FusedMLP(nn.Module):
         )
     
     def forward(self, x):
-        """Fuse RMSNorm + FC projection, then gate-value activation."""
-        x_norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.ln.eps) * self.ln.weight
-        gv = F.linear(x_norm, self.fc.weight, self.fc.bias)
-        u, v = gv.chunk(2, dim=-1)
+        """Fused forward: torch.compile merges all ops into minimal kernels."""
+        u, v = self.fc(x).chunk(2, dim=-1)
         if self.activation == "swiglu":
             return self.proj(F.silu(u) * v)
         elif self.activation == "geglu":
@@ -321,42 +322,50 @@ class FusedMLP(nn.Module):
 # TRANSFORMER BLOCK
 # =========================================================
 class Block(nn.Module):
-    """Transformer block: Attention + residual + MLP + residual."""
+    """Transformer block: attention → MLP with residual connections and layer norm."""
+    
     def __init__(self, cfg):
         super().__init__()
+        self.ln1 = RMSNorm(cfg.d_model)
+        self.ln2 = RMSNorm(cfg.d_model)
         self.attn = Attention(cfg)
-        # 64-align hidden dim for TPU systolic array efficiency
-        hidden = int(4/3 * cfg.mlp_ratio * cfg.d_model)
-        hidden = (hidden + 63) // 64 * 64
-        self.mlp = FusedMLP(cfg.d_model, hidden, cfg.activation)
         self.gradient_checkpointing = cfg.gradient_checkpointing
+        
         self.drop1 = nn.Dropout(cfg.dropout)
         self.drop2 = nn.Dropout(cfg.dropout)
 
+        # Align hidden dim to GPU tensor cores (multiples of 64)
+        hidden_dim = ((int(4/3 * cfg.mlp_ratio * cfg.d_model) + 63) // 64) * 64
+        self.mlp = FusedMLP(cfg.d_model, hidden_dim, cfg.activation)
+
     def forward(self, x, cache=None):
-        """Apply attention, residual, MLP, residual."""
+        """Pre-norm residual blocks with torch.compile fusion optimization."""
+        # Attention: pre-norm + attn + residual + dropout
         if self.gradient_checkpointing and self.training:
-            a, cache = torch.utils.checkpoint.checkpoint(
-                self.attn, x, cache, use_reentrant=False
-            )
+            def attn_fn(x_):
+                return self.attn(self.ln1(x_), cache)
+            attn_out, cache = torch.utils.checkpoint.checkpoint(attn_fn, x, use_reentrant=False)
         else:
-            a, cache = self.attn(x, cache)
-        x = x + self.drop1(a)
+            attn_out, cache = self.attn(self.ln1(x), cache)
+        x = x + self.drop1(attn_out)
 
+        # MLP: pre-norm + mlp + residual + dropout
         if self.gradient_checkpointing and self.training:
-            h = torch.utils.checkpoint.checkpoint(
-                self.mlp, x, use_reentrant=False
-            )
+            def mlp_fn(x_):
+                return self.mlp(self.ln2(x_))
+            mlp_out = torch.utils.checkpoint.checkpoint(mlp_fn, x, use_reentrant=False)
         else:
-            h = self.mlp(x)
-
-        x = x + self.drop2(h)
+            mlp_out = self.mlp(self.ln2(x))
+        x = x + self.drop2(mlp_out)
+        
         return x, cache
 
 # =========================================================
 # GPT MODEL
 # =========================================================
 class GPT(nn.Module):
+    """GPT-style transformer with flash attention and GQA for efficient training/inference."""
+    
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -364,12 +373,12 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.ln_f = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        self.head.weight = self.tok.weight
+        self.head.weight = self.tok.weight  # Weight tying
         self.apply(self._init)
 
     def _init(self, m):
+        """Initialize weights with scaled std for deeper networks."""
         if isinstance(m, nn.Linear):
-            # Scale init std by 1/sqrt(n_layers) for deeper networks
             std = self.cfg.init_std / (self.cfg.n_layers ** 0.5)
             nn.init.normal_(m.weight, std=std)
             if m.bias is not None:
@@ -378,55 +387,33 @@ class GPT(nn.Module):
             nn.init.normal_(m.weight, std=self.cfg.init_std)
 
     def allocate_kv_cache(self, batch_size, max_seq_len, device, dtype):
-        """Preallocate full MHA KV cache for generation."""
+        """Preallocate KV cache for efficient generation."""
         cache = []
+        n_kv_heads = self.cfg.n_heads // 2  # GQA
         head_dim = self.cfg.d_model // self.cfg.n_heads
         
         for _ in range(self.cfg.n_layers):
-            k_cache = torch.zeros(batch_size, max_seq_len, self.cfg.n_heads, head_dim,
+            k_cache = torch.zeros(batch_size, max_seq_len, n_kv_heads, head_dim,
                                  device=device, dtype=dtype)
             v_cache = torch.zeros_like(k_cache)
             cache.append((k_cache, v_cache, 0))
         return cache
 
     def forward(self, idx, cache=None):
-        """Forward with optional KV cache. idx shape: (B, T), returns logits (B, T, vocab_size)."""
+        """Forward pass with optional KV cache for generation."""
         x = self.tok(idx)
         
         if cache is None:
+            # Training or prefill: no cache
             for blk in self.blocks:
                 x, _ = blk(x, None)
-            return self.head(self.ln_f(x)), None
-        
-        new_cache = []
-        for i, blk in enumerate(self.blocks):
-            x, blk_cache = blk(x, cache[i])
-            new_cache.append(blk_cache)
-        return self.head(self.ln_f(x)), new_cache
+        else:
+            # Generation: use KV cache
+            new_cache = []
+            for i, blk in enumerate(self.blocks):
+                x, blk_cache = blk(x, cache[i])
+                new_cache.append(blk_cache)
+            cache = new_cache
 
-    @torch.no_grad()
-    def forward_prefill(self, idx, cache):
-        """Prefill phase: process prompt (B, T) with T > 1. Separate XLA compilation from decode."""
-        x = self.tok(idx)
-        new_cache = []
-        for i, blk in enumerate(self.blocks):
-            x, blk_cache = blk(x, cache[i])
-            new_cache.append(blk_cache)
         logits = self.head(self.ln_f(x))
-        xm.mark_step()  # Finalize prefill computation
-        return logits, new_cache
-
-    @torch.no_grad()
-    def forward_generate(self, idx, cache, step):
-        """Generation forward with static T=1 for XLA (separate compiled graph)."""
-        assert idx.shape[1] == 1, f"forward_generate requires T=1, got T={idx.shape[1]}"
-        
-        x = self.tok(idx)
-        new_cache = []
-        for i, blk in enumerate(self.blocks):
-            x, blk_cache = blk(x, cache[i])
-            new_cache.append(blk_cache)
-        
-        logits = self.head(self.ln_f(x))
-        xm.mark_step()  # Finalize XLA computation and flush to device
-        return logits, new_cache
+        return logits, cache

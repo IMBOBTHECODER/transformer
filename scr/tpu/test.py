@@ -20,12 +20,18 @@ parser.add_argument("--temperature", type=float, default=0.8, help="Sampling tem
 parser.add_argument("--top_k", type=int, default=30, help="Top-k sampling")
 parser.add_argument("--checkpoint", type=str, default="ema", choices=["ema", "model"], 
                     help="Checkpoint: 'ema' or 'model'")
+parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 args = parser.parse_args()
+
+if args.seed is not None:
+    torch.manual_seed(args.seed)
 
 # =========================================================
 # LOAD MODEL
 # =========================================================
 model = GPT(cfg).to(device=device, dtype=cfg.dtype)
+model.eval()
+print(f"Model: {cfg.id} | Vocab: {cfg.vocab_size} | Device: {device}")
 
 checkpoint_name = f"best_ema_model_{cfg.id}.pt" if args.checkpoint == "ema" else f"best_model_{cfg.id}.pt"
 checkpoint_path = f"model/{checkpoint_name}"
@@ -52,30 +58,42 @@ else:
 # TOKENIZER
 # =========================================================
 tokenizer = BPETokenizer(cfg.vocab_size)
-tokenizer_path = f"tokenizer_{cfg.id}.json"
+tokenizer_path = f"tokenizer/tokenizer_{cfg.id}.json"
 
 if os.path.exists(tokenizer_path):
     print(f"✓ Tokenizer loaded")
     tokenizer.load(tokenizer_path)
 else:
-    raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}. Run: python tpu/tokenizer.py")
+    raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}. Run: python -c \"from admin import Control; c = Control(); c.tokenize()\"")
 
 # =========================================================
 # GENERATION
 # =========================================================
 if args.prompt is None:
-    print("\nUsage: python test.py \"prompt\" [steps] [--checkpoint {ema,model}]")
-    print("Example: python test.py \"Once upon a time\" 100 --checkpoint ema")
+    print("\nUsage: python test.py \"prompt\" [steps] [--checkpoint {ema,model}] [--seed SEED]")
+    print("Example: python test.py \"Once upon a time\" 100 --checkpoint ema --seed 42")
     print()
     prompt = input("Prompt: ").strip()
 else:
     prompt = args.prompt
+
+# Validate inputs
+if not prompt:
+    raise ValueError("Prompt cannot be empty")
+if args.steps <= 0:
+    raise ValueError("Steps must be positive")
+if args.temperature <= 0:
+    raise ValueError("Temperature must be positive")
+if args.top_k < 0:
+    raise ValueError("Top-k must be non-negative")
 
 steps = args.steps
 temperature = args.temperature
 top_k = args.top_k
 
 print(f"\nGenerating {steps} tokens from: '{prompt}'")
+if args.seed is not None:
+    print(f"Seed: {args.seed}")
 print("-" * 60)
 
 with torch.no_grad():
@@ -102,15 +120,22 @@ with torch.no_grad():
         logits = logits[:, -1:] / temperature
         
         # Top-k sampling
-        if top_k > 0:
-            top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
-            logits_mask = torch.full_like(logits, float('-inf'))
-            logits_mask.scatter_(-1, top_k_indices, top_k_logits)
-            logits = logits_mask
+        if top_k > 0 and top_k < logits.shape[-1]:
+            top_k_vals, _ = torch.topk(logits, top_k, dim=-1)
+            min_top_k = top_k_vals[..., -1:]
+            logits = torch.where(logits < min_top_k, torch.tensor(float('-inf'), device=device), logits)
         
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs.squeeze(-1), 1).unsqueeze(1)
+        
+        # Early stopping on end-of-text token (if vocab supports it)
+        if hasattr(tokenizer, 'eos_token_id') and next_token.item() == tokenizer.eos_token_id:
+            break
+        
         generated = torch.cat([generated, next_token], dim=1)
     
     output_text = tokenizer.decode(generated[0].tolist())
+    print("\nGenerated text:")
+    print("=" * 60)
     print(output_text)
+    print("=" * 60)

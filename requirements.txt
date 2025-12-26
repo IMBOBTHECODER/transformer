@@ -5,6 +5,7 @@ torch-xla[tpu]>=2.0.0  # TPU support with XLA backend
 # Dataset & tokenization
 datasets>=2.14.0
 tokenizers>=0.13.3
+pyarrow>=15.0.0  # Compatible with datasets
 
 # Development (optional)
 # For profiling and monitoring on TPU:
