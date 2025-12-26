@@ -66,8 +66,8 @@ class GPTConfig:
     # TRAINING SCHEDULE & TRACKING
     # =========================================================
     init_std: float = 0.02
-    id: str = "tinystories"
-    total_steps: int = 5_000
+    id: str = "wikitext103"
+    total_steps: int = 10_000
     val_interval: int = 200
     use_ema: bool = True
     ema_decay: float = 0.99
