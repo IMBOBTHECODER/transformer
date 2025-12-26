@@ -1,4 +1,12 @@
-# Python
+# Core deep learning
 torch>=2.0.0
-datasets>=2.10.0
-tokenizers>=0.13.0
+torch-xla[tpu]>=2.0.0  # TPU support with XLA backend
+
+# Dataset & tokenization
+datasets>=2.14.0
+tokenizers>=0.13.3
+
+# Development (optional)
+# For profiling and monitoring on TPU:
+# tensorboard>=2.10.0
+# wandb>=0.15.0

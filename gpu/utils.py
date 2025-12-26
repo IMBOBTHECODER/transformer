@@ -1,42 +1,45 @@
-# utils.py
+# utils.py (GPU-optimized)
+"""GPU-specific optimizers and utilities for efficient training."""
+
 import torch
 import torch.nn.functional as F
 
 # =========================================================
-# ACTIVATION
+# ACTIVATION FUNCTIONS
 # =========================================================
-
 def activation_fn(name: str):
+    """Get activation function by name."""
     name = name.lower()
-
-    if name == "relu":
-        return F.relu
-    if name == "relu2":
-        return lambda x: F.relu(x) ** 2
-    if name == "gelu":
-        return F.gelu
-    if name == "silu":
-        return F.silu
-    if name == "mish":
-        return F.mish
-    if name == "snake":
-        return lambda x: x + torch.sin(x) ** 2
-
-    raise ValueError(f"Unary activation '{name}' not supported")
+    
+    activations = {
+        "relu": F.relu,
+        "relu2": lambda x: F.relu(x) ** 2,
+        "gelu": F.gelu,
+        "silu": F.silu,
+        "mish": F.mish,
+        "snake": lambda x: x + torch.sin(x) ** 2,
+    }
+    
+    if name not in activations:
+        raise ValueError(f"Unknown activation: {name}")
+    return activations[name]
 
 
 
 # =========================================================
-# PARAMETER GROUPING (DECAY / NO-DECAY)
+# PARAMETER GROUPING (Weight Decay / No Decay)
 # =========================================================
 def param_groups(model, weight_decay):
+    """Separate parameters into decay and no-decay groups for AdamW."""
     decay, no_decay = [], []
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
+        # No decay: low-dim params (bias, norm weights)
         if p.dim() < 2 or "ln" in name or "bias" in name:
             no_decay.append(p)
+        # Decay: high-dim params (linear layers)
         else:
             decay.append(p)
 
@@ -47,9 +50,15 @@ def param_groups(model, weight_decay):
 
 
 # =========================================================
-# LION OPTIMIZER
+# LION OPTIMIZER (Sign-Based Update)
 # =========================================================
 class Lion(torch.optim.Optimizer):
+    """Lion: weight decay generalization to all parameters. Uses sign(m) instead of m.
+    
+    Reference: https://arxiv.org/abs/2302.06675
+    Often outperforms AdamW with larger learning rates and less warmup.
+    """
+    
     def __init__(self, params, lr, betas=(0.9, 0.99), wd=0.0):
         super().__init__(params, dict(lr=lr, betas=betas, wd=wd))
 
@@ -62,34 +71,49 @@ class Lion(torch.optim.Optimizer):
             for p in g["params"]:
                 if p.grad is None:
                     continue
+                
+                # Maintain exponential moving average of gradients
                 state = self.state.setdefault(p, {})
                 m = state.setdefault("m", torch.zeros_like(p))
-
+                
+                # Update bias: m_t = β₂ * m_{t-1} + (1 - β₂) * g_t
                 m.mul_(b2).add_(p.grad, alpha=1 - b2)
+                
+                # Update params: θ_t = θ_{t-1} - lr * sign(m_t)
                 p.add_(torch.sign(m), alpha=-lr)
-
+                
+                # Weight decay: θ_t = θ_t - lr * λ * θ_{t-1}
                 if wd > 0:
                     p.add_(p, alpha=-lr * wd)
 
 
 # =========================================================
-# SAM (SHARPNESS-AWARE MINIMIZATION)
+# SAM (Sharpness-Aware Minimization)
 # =========================================================
 class SAM:
+    """Sharpness-Aware Minimization: seeks flat minima for better generalization.
+    
+    Two-step process: perturb weights in gradient direction, compute loss on 
+    perturbed weights, then step with that gradient. Adds ~100% compute overhead.
+    """
+    
     def __init__(self, base_optimizer, rho=0.05):
         self.base = base_optimizer
         self.rho = rho
 
     @torch.no_grad()
     def first_step(self):
-        norm = torch.norm(torch.stack([
-            p.grad.norm()
-            for g in self.base.param_groups
-            for p in g["params"]
-            if p.grad is not None
+        """Perturb weights: θ → θ + ρ/‖∇L‖ * ∇L"""
+        # Compute gradient norm across all parameters
+        grad_norm = torch.norm(torch.stack([
+            p.grad.norm() for g in self.base.param_groups
+            for p in g["params"] if p.grad is not None
         ]))
-        scale = self.rho / (norm + 1e-12)
-
+        
+        # Scale factor for perturbation
+        scale = self.rho / (grad_norm + 1e-12)
+        
+        # Apply perturbation: θ += scale * ∇L
         for g in self.base.param_groups:
             for p in g["params"]:
                 if p.grad is not None:
@@ -97,6 +121,7 @@ class SAM:
 
     @torch.no_grad()
     def second_step(self):
+        """Step with loss gradient at perturbed weights."""
         self.base.step()
         self.base.zero_grad()
 
@@ -105,23 +130,16 @@ class SAM:
 # OPTIMIZER FACTORY
 # =========================================================
 def build_optimizer(model, cfg):
+    """Build optimizer with parameter grouping and optional SAM wrapper."""
     groups = param_groups(model, cfg.weight_decay)
     
-    # Check if running on TPU (XLA)
-    try:
-        import torch_xla.core.xla_model as xm
-        has_xla = True
-    except ImportError:
-        has_xla = False
-
     if cfg.optimizer == "adamw":
-        # TPU: disable fused (not supported on XLA devices)
-        # GPU/CPU: use fused for performance
+        # GPU: use fused AdamW for faster kernels
         opt = torch.optim.AdamW(
             groups,
             lr=cfg.lr,
             betas=cfg.betas,
-            fused=not has_xla  # Disable fused on TPU
+            fused=True  # CUDA-optimized kernel
         )
     elif cfg.optimizer == "lion":
         opt = Lion(groups, lr=cfg.lr, wd=cfg.weight_decay)
@@ -133,6 +151,7 @@ def build_optimizer(model, cfg):
             nesterov=True
         )
     else:
-        raise ValueError(cfg.optimizer)
+        raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
 
+    # Wrap with SAM if enabled (2x compute, better generalization)
     return SAM(opt, cfg.sam_rho) if cfg.sam else opt
