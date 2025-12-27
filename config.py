@@ -44,8 +44,8 @@ class GPTConfig:
     lr: float = 3e-4
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
-    batch_size: int = 128
-    sequence_length: int = 512
+    batch_size: int = 32
+    sequence_length: int = 256
 
     # =========================================================
     # REGULARIZATION

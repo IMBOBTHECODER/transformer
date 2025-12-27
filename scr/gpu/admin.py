@@ -33,10 +33,10 @@ cfg = apply_gpu_device_tuning(cfg)
 if torch.cuda.is_available():
     device = "cuda"
     gpu_name = torch.cuda.get_device_name(0).lower()
-    print(f"✓ GPU: {gpu_name.upper()} | {cfg.dtype} | Compile: {cfg.compile}")
+    print(f"GPU: {gpu_name.upper()} | {cfg.dtype} | Compile: {cfg.compile}")
 else:
     device = "cpu"
-    print("✓ CPU mode")
+    print("CPU mode")
 
 print(f"Device: {device}\n")
 
@@ -46,10 +46,6 @@ print(f"Device: {device}\n")
 # =========================================================
 def prepare_tokenizer_and_dataset(vocab_size, tokenizer_id, num_samples=250000):
     """Train tokenizer and tokenize dataset."""
-    print("=" * 50)
-    print("Tokenizer & Dataset Preparation")
-    print("=" * 50)
-
     tokenizer_path = f"tokenizer/tokenizer_{tokenizer_id}.json"
     tokens_path = f"tokenizer/tokens_{tokenizer_id}.npy"
 
