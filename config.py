@@ -44,7 +44,7 @@ class GPTConfig:
     lr: float = 3e-4
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
-    batch_size: int = 32
+    batch_size: int = 64
     sequence_length: int = 256
 
     # =========================================================
@@ -77,9 +77,9 @@ class GPTConfig:
     # =========================================================
     # DATASET CONFIGURATION
     # =========================================================
-    dataset_name: str = "roneneldan/TinyStories"
-    dataset_config: str = None  # Set to None for datasets without config, or config name (e.g., "wikitext-103-raw-v1")
-    num_samples: int = 350_000
+    dataset_name: str = "Salesforce/wikitext"
+    dataset_config: str = "wikitext-103-raw-v1"  # Set to None for datasets without config, or config name (e.g., "wikitext-103-raw-v1")
+    num_samples: int = 500_000
     dataset_split: str = "train"  # Dataset split (train/validation/test)
 
 
